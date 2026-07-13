@@ -32,14 +32,17 @@ CSV input format (ta_sessions_today.csv):
       is skipped and simply won't appear in the report.
 
 Requirements (on top of requirements.txt):
-    Same as auto_lecture_analyzer.py, plus ffmpeg on PATH for audio extraction.
+    google-genai, pydantic, plus ffmpeg/ffprobe on PATH (duration + audio
+    quality heuristic — the transcript/diarization/analysis itself is done by
+    Gemini directly on the uploaded video, no local audio extraction needed).
 
 Run manually:
-    GROQ_API_KEY=your_key python ta_session_analyzer.py ta_sessions_today.csv
+    GEMINI_API_KEY=your_key python ta_session_analyzer.py ta_sessions_today.csv
 
-Free-tier note: this whole pipeline runs entirely on Groq (Whisper for
-transcription, Llama for labeling/analysis/vision) so a 20-30 session test
-batch stays within the free tier's request limits. Sessions are processed
+Free-tier note: this pipeline runs on the Gemini API (see ta_core.py for
+model/rate-limit notes). One combined multimodal call per session (plus an
+optional small chat-analysis call) stays comfortably within the free tier's
+request-per-day limit for a 20-30 session test batch. Sessions are processed
 one at a time with retries/backoff below to ride out transient rate limits.
 """
 
@@ -58,7 +61,7 @@ from ta_pdf_report import generate_ta_pdf
 # CONFIG
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # never hardcode this
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # never hardcode this
 OUTPUT_DIR = "ta_reports"
 MAX_RETRIES = 3
 
@@ -97,7 +100,7 @@ def process_session(row: dict, run_date: str) -> dict:
             try:
                 print(f"[{session_id}] analyzing (attempt {attempt})...")
                 report = analyze_ta_session(
-                    GROQ_API_KEY, tmp_video,
+                    GEMINI_API_KEY, tmp_video,
                     analyze_screen=analyze_screen, chat_text=chat_text,
                 )
                 break
@@ -153,8 +156,8 @@ def process_session(row: dict, run_date: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_daily_batch(csv_path: str):
-    if not GROQ_API_KEY:
-        raise EnvironmentError("Set GROQ_API_KEY as an environment variable before running.")
+    if not GEMINI_API_KEY:
+        raise EnvironmentError("Set GEMINI_API_KEY as an environment variable before running.")
 
     run_date = datetime.now().strftime("%Y-%m-%d")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -209,7 +212,7 @@ if __name__ == "__main__":
 #
 # Linux/Mac (cron) — runs every day at 8 PM:
 #   crontab -e
-#   0 20 * * * cd "/path/to/Lecture analyzer" && GROQ_API_KEY=xxx /usr/bin/python3 ta_session_analyzer.py ta_sessions_today.csv >> logs/ta_run.log 2>&1
+#   0 20 * * * cd "/path/to/Lecture analyzer" && GEMINI_API_KEY=xxx /usr/bin/python3 ta_session_analyzer.py ta_sessions_today.csv >> logs/ta_run.log 2>&1
 #
 # Windows (Task Scheduler):
 #   1. Task Scheduler > Create Basic Task > Daily, pick a time
@@ -217,7 +220,7 @@ if __name__ == "__main__":
 #      Program: python.exe
 #      Arguments: ta_session_analyzer.py ta_sessions_today.csv
 #      Start in: the lecture-analyzer folder
-#   3. Set GROQ_API_KEY as a permanent environment variable so the scheduled
+#   3. Set GEMINI_API_KEY as a permanent environment variable so the scheduled
 #      task can see it.
 #
 # Either way, ta_sessions_today.csv needs to be updated with that day's TA

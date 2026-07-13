@@ -1,32 +1,31 @@
 """
 Core analysis engine for the TA Session Analyzer.
 
-Pipeline (per the PRD):
-    Recording -> Extract Audio -> Speech-to-Text -> Speaker Diarization
-              -> LLM Analysis -> Scorecard + Report
+Pipeline:
+    Recording -> upload to Gemini Files API -> single multimodal call that
+    transcribes + diarizes (TA vs Student) + reads the shared screen + scores
+    the session against the rubric -> local participation/dead-air math ->
+    weighted scorecard + report.
 
-Diarization note: true audio diarization (e.g. pyannote.audio) needs torch +
-a Hugging Face auth token, which is a heavy install for a free-tier testing
-phase. Instead, speakers are separated by transcribing with Groq Whisper
-(timestamped segments) and then asking an LLM to label each utterance as
-TA or Student from conversational cues (who's guiding vs. who's asking).
-This works well for the single-TA / single-student case this tool targets,
-including English/Hindi code-switched speech, but is not real audio-based
-diarization — it will be less reliable with overlapping speech or more than
-one student.
+Provider note: this pipeline runs on the Gemini API (free tier) instead of
+Groq. Gemini watches the actual video (voices + shared screen together)
+rather than diarizing from a text transcript alone, which is materially more
+reliable for telling TA and student apart — worth it given this tool targets
+single-TA/single-student calls with natural English/Hindi code-switching.
+The rest of the codebase (app.py, analyze.py, core.py, auto_lecture_analyzer.py)
+is untouched and still runs on Groq.
 """
 
 import json
 import os
-import re
 import subprocess
-import tempfile
-from pathlib import Path
+import time
+from typing import List, Literal, Optional
 
-import cv2
-from groq import Groq
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
 
-from core import load_image_file
 from recording_utils import get_duration_seconds
 
 # ─── Scoring config (per PRD "Final Score" table) ────────────────────────────
@@ -53,21 +52,12 @@ SESSION_STAGES = [
     "Closing",
 ]
 
-TRANSCRIBE_MODEL   = "whisper-large-v3"
-LABEL_MODEL        = "llama-3.1-8b-instant"
-ANALYSIS_MODEL     = "llama-3.3-70b-versatile"
-VISION_MODEL       = "meta-llama/llama-4-scout-17b-16e-instruct"
+# If this model name 404s on your account, try "gemini-2.5-flash" instead —
+# both are free-tier eligible as of mid-2026.
+GEMINI_MODEL = "gemini-3.5-flash"
 
-GROQ_AUDIO_SIZE_LIMIT = 24 * 1024 * 1024  # Groq free tier caps uploads at 25MB
-
-
-# ─── Small shared helpers ────────────────────────────────────────────────────
-
-def _strip_fences(raw: str) -> str:
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return raw
+FILE_ACTIVE_POLL_SECONDS = 3
+FILE_ACTIVE_TIMEOUT_SECONDS = 180
 
 
 def fmt_ts(seconds: float) -> str:
@@ -75,25 +65,16 @@ def fmt_ts(seconds: float) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-# ─── 1. Audio extraction ─────────────────────────────────────────────────────
+# ─── 1. Local, provider-agnostic signal (no LLM needed) ─────────────────────
 
-def extract_audio(video_path: str, out_path: str):
-    """Mono 16kHz, low bitrate — small enough to stay under free-tier upload limits."""
-    result = subprocess.run(
-        ["ffmpeg", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
-         "-b:a", "64k", out_path, "-y"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio extraction failed: {result.stderr}")
-
-
-def estimate_audio_quality(audio_path: str) -> dict:
+def estimate_audio_quality(media_path: str) -> dict:
     """Lightweight heuristic proxy for audio quality using ffmpeg's volumedetect
-    filter. NOT true noise/echo detection — just flags very low average volume,
-    which usually means a poor/distant microphone."""
+    filter, run straight on the video (ffmpeg pulls out the audio stream
+    itself, so there's no need to pre-extract audio to a separate file). NOT
+    true noise/echo detection — just flags very low average volume, which
+    usually means a poor/distant microphone."""
     result = subprocess.run(
-        ["ffmpeg", "-i", audio_path, "-af", "volumedetect", "-f", "null", "-"],
+        ["ffmpeg", "-i", media_path, "-af", "volumedetect", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     mean_vol = None
@@ -107,132 +88,6 @@ def estimate_audio_quality(audio_path: str) -> dict:
     if mean_vol is not None and mean_vol < -35:
         quality_flag = "Low average audio volume detected — possible poor microphone or distance from mic."
     return {"mean_volume_db": mean_vol, "quality_flag": quality_flag}
-
-
-# ─── 2. Speech-to-text (Groq Whisper) ────────────────────────────────────────
-
-def _transcribe_single(api_key: str, audio_path: str, time_offset: float = 0.0) -> list:
-    client = Groq(api_key=api_key)
-    with open(audio_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            model=TRANSCRIBE_MODEL,
-            file=(os.path.basename(audio_path), f.read()),
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
-    segments = getattr(response, "segments", None)
-    if segments is None and hasattr(response, "model_extra"):
-        segments = (response.model_extra or {}).get("segments", [])
-    segments = segments or []
-
-    out = []
-    for seg in segments:
-        get = seg.get if isinstance(seg, dict) else (lambda k, d=None: getattr(seg, k, d))
-        text = (get("text", "") or "").strip()
-        if not text:
-            continue
-        out.append({
-            "start": float(get("start", 0.0)) + time_offset,
-            "end":   float(get("end", 0.0)) + time_offset,
-            "text":  text,
-            "avg_logprob": get("avg_logprob"),
-        })
-    return out
-
-
-def transcribe_audio(api_key: str, audio_path: str, chunk_seconds: int = 1200) -> list:
-    """Returns a flat list of {start, end, text, avg_logprob} segments across
-    the whole file, splitting into ~20-minute chunks first if the file is too
-    large for a single Groq upload."""
-    if os.path.getsize(audio_path) <= GROQ_AUDIO_SIZE_LIMIT:
-        return _transcribe_single(api_key, audio_path)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        pattern = os.path.join(tmp, "chunk_%03d.mp3")
-        result = subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-f", "segment",
-             "-segment_time", str(chunk_seconds), "-c", "copy", pattern, "-y"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg chunk split failed: {result.stderr}")
-
-        chunk_files = sorted(Path(tmp).glob("chunk_*.mp3"))
-        all_segments = []
-        for i, cf in enumerate(chunk_files):
-            all_segments.extend(_transcribe_single(api_key, str(cf), time_offset=i * chunk_seconds))
-        return all_segments
-
-
-def estimate_transcription_confidence(raw_segments: list) -> float:
-    """Derives a 0-100 confidence score from Whisper's own avg_logprob per segment."""
-    logprobs = [s["avg_logprob"] for s in raw_segments if s.get("avg_logprob") is not None]
-    if not logprobs:
-        return 75.0  # unknown — moderate default
-    avg = sum(logprobs) / len(logprobs)
-    pct = max(0.0, min(100.0, (avg + 1.5) / 1.5 * 100))
-    return round(pct, 1)
-
-
-# ─── 3. Speaker diarization (LLM-based, see module docstring) ───────────────
-
-def merge_segments(raw_segments: list, gap_threshold: float = 1.2) -> list:
-    """Merge consecutive Whisper segments into larger utterances when the gap
-    between them is small, so the labeling call has fewer, more meaningful
-    chunks to classify."""
-    merged = []
-    for seg in raw_segments:
-        if merged and seg["start"] - merged[-1]["end"] <= gap_threshold:
-            merged[-1]["end"] = seg["end"]
-            merged[-1]["text"] += " " + seg["text"]
-        else:
-            merged.append({"start": seg["start"], "end": seg["end"], "text": seg["text"]})
-    return merged
-
-
-LABEL_SYSTEM_PROMPT = """You are labeling speaker turns from a TA (teaching assistant) doubt-clearing session recording.
-
-Given a numbered list of transcript utterances with timestamps, label each one as either "TA" or "Student".
-- The TA is the one guiding, explaining concepts, asking clarifying/verification questions, and concluding the discussion.
-- The student is the one describing their problem/doubt, asking questions, and responding to explanations.
-- If more than one non-TA voice appears, label all of them "Student".
-- The session may mix English and Hindi (Hinglish) — this is normal; language switching does not indicate a speaker change by itself. Judge by role and content.
-
-Return ONLY valid JSON, no markdown, no extra text:
-{"labels": ["TA"|"Student", ...]}
-The "labels" array must have exactly as many entries as there are utterances, in the same order."""
-
-
-def label_speakers(api_key: str, merged_segments: list, batch_size: int = 100) -> list:
-    if not merged_segments:
-        return []
-    client = Groq(api_key=api_key)
-    labels = []
-    for i in range(0, len(merged_segments), batch_size):
-        batch = merged_segments[i:i + batch_size]
-        lines = [
-            f"[{j}] ({fmt_ts(seg['start'])}-{fmt_ts(seg['end'])}): {seg['text']}"
-            for j, seg in enumerate(batch)
-        ]
-        user_content = f"Utterances (count={len(batch)}):\n" + "\n".join(lines)
-        response = client.chat.completions.create(
-            model=LABEL_MODEL,
-            max_tokens=2000,
-            messages=[
-                {"role": "system", "content": LABEL_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        parsed = json.loads(_strip_fences(response.choices[0].message.content))
-        batch_labels = parsed.get("labels", [])
-        if len(batch_labels) < len(batch):
-            batch_labels = batch_labels + ["Student"] * (len(batch) - len(batch_labels))
-        labels.extend(batch_labels[:len(batch)])
-
-    return [
-        {**seg, "speaker": lab if lab in ("TA", "Student") else "Student"}
-        for seg, lab in zip(merged_segments, labels)
-    ]
 
 
 def compute_participation(labeled_segments: list) -> dict:
@@ -277,157 +132,121 @@ def build_transcript_text(labeled_segments: list) -> str:
     )
 
 
-# ─── 4. Main LLM analysis ────────────────────────────────────────────────────
+# ─── 2. Gemini response schemas ──────────────────────────────────────────────
 
-MAIN_SYSTEM_PROMPT = f"""You are an expert instructional-quality reviewer evaluating a TA (teaching assistant) doubt-clearing session, from its speaker-labeled transcript (TA vs Student). The transcript may mix English and Hindi (Hinglish) — treat this as normal, not a quality issue.
+class TranscriptSegment(BaseModel):
+    start_sec: float
+    end_sec: float
+    speaker: Literal["TA", "Student"]
+    text: str
 
-Evaluate these dimensions:
 
-1. Doubt Resolution (highest priority): did the TA understand the question, ask clarifying questions, explain the concept, verify the student's understanding, and conclude the discussion? Confirmations from the student ("Got it", "Makes sense", "Thank you", "Understood") increase confidence it was resolved. If the session ends abruptly with no confirmation, lean toward "Not Resolved". Classify as "Fully Resolved", "Partially Resolved", or "Not Resolved".
+class ScreenShare(BaseModel):
+    summary: str
+    content_types_observed: List[str]
+    direct_solution_detected: bool
+    code_or_query_evidence: List[str]
+    classification: Literal["Good", "Warning", "Violation"]
+
+
+class DoubtResolution(BaseModel):
+    status: Literal["Fully Resolved", "Partially Resolved", "Not Resolved"]
+    reasoning: str
+
+
+class TeachingQuality(BaseModel):
+    score: int
+    reasoning: str
+
+
+class DirectSolution(BaseModel):
+    classification: Literal["Good", "Warning", "Violation"]
+    evidence: str
+
+
+class Communication(BaseModel):
+    score: int
+    issues: List[str]
+
+
+class ConceptVsAnswer(BaseModel):
+    classification: Literal["Concept-based", "Mixed", "Answer-based"]
+    reasoning: str
+
+
+class SessionFlow(BaseModel):
+    stages_present: List[str]
+    stages_missing: List[str]
+
+
+class Professionalism(BaseModel):
+    rating: Literal["Excellent", "Good", "Fair", "Poor"]
+    issues: List[str]
+
+
+class TechnicalAccuracy(BaseModel):
+    status: Literal["Correct", "Incorrect Guidance"]
+    confidence_pct: int
+    details: str
+
+
+class SessionAnalysisResult(BaseModel):
+    transcript_segments: List[TranscriptSegment]
+    transcription_confidence_pct: float
+    screen_share: ScreenShare
+    doubt_resolution: DoubtResolution
+    teaching_quality: TeachingQuality
+    direct_solution: DirectSolution
+    communication: Communication
+    concept_vs_answer: ConceptVsAnswer
+    session_flow: SessionFlow
+    professionalism: Professionalism
+    technical_accuracy: TechnicalAccuracy
+    student_sentiment: Literal["Satisfied", "Neutral", "Dissatisfied"]
+    summary: str
+    recommendations: List[str]
+
+
+class ChatAnalysisResult(BaseModel):
+    classification: Literal["Good", "Warning", "Violation"]
+    direct_code_or_sql: List[str]
+    external_links: List[str]
+    hint_examples: List[str]
+    violation_examples: List[str]
+
+
+# ─── 3. Prompts ───────────────────────────────────────────────────────────────
+
+COMBINED_SYSTEM_PROMPT = f"""You are an expert instructional-quality reviewer analyzing a TA (teaching assistant) doubt-clearing session directly from its video recording (voices + shared screen together). The session may mix English and Hindi (Hinglish) — treat this as normal, not a quality issue.
+
+Step 1 — Transcribe and diarize the whole recording:
+Produce merged, coherent utterances (not word-by-word fragments). For each utterance give start_sec and end_sec (seconds from the start of the video, as numbers), the speaker, and the text. The TA is the one guiding, explaining concepts, asking clarifying/verification questions, and concluding the discussion. The student is the one describing their doubt, asking questions, and responding to explanations. If more than one non-TA voice appears, label all of them "Student". Use voice, visual cues (e.g. who is driving the shared screen), and conversational role together — do not rely on content alone. Also report transcription_confidence_pct (0-100): your own confidence in the transcript's accuracy, lower for unclear audio, heavy accents, overlapping speech, or long inaudible stretches.
+
+Step 2 — Read the shared screen throughout the video:
+Note what kind of content was shown (coding IDE, terminal, browser, LeetCode/judge, notebook, slides, file explorer, other), and whether any code/SQL/query visible on screen was a complete, ready-to-submit final solution rather than a partial hint. classification is "Good" if only hints/guidance were visible, "Warning" if borderline/near-complete help was shown, "Violation" if a complete final solution was shown on screen. If screen analysis was not requested for this session (see the user message), set classification to "Good", leave content_types_observed/code_or_query_evidence empty, and note in summary that screen analysis was skipped by request.
+
+Step 3 — Evaluate these dimensions using the transcript and the shared screen together:
+
+1. Doubt Resolution (highest priority): did the TA understand the question, ask clarifying questions, explain the concept, verify the student's understanding, and conclude the discussion? Confirmations from the student ("Got it", "Makes sense", "Thank you", "Understood") increase confidence it was resolved. If the session ends abruptly with no confirmation, lean toward "Not Resolved".
 
 2. Teaching Quality (1-5): does the TA explain concepts, break the problem into steps, give examples, use debugging, encourage the student's own thinking, and avoid spoon-feeding?
 
-3. Direct Solution Detection (critical): did the TA give hints and guidance ("Good"), give too much help/almost-complete steps ("Warning"), or directly hand over the final code/query/assignment answer ("Warning" if borderline, "Violation" if a complete final solution was given outright)?
+3. Direct Solution Detection (critical): did the TA give hints and guidance ("Good"), give too much help/almost-complete steps ("Warning"), or directly hand over the final code/query/assignment answer ("Warning" if borderline, "Violation" if a complete final solution was given outright, spoken or shown on screen)?
 
 4. Communication (1-5): clarity, confidence, pace, friendliness, professionalism of delivery. Note any interruptions, long confusing tangents, or unclear explanations as issues.
 
 5. Concept vs Answer: did the TA mostly teach concepts/logic/debugging ("Concept-based"), mostly give final answers ("Answer-based"), or a mix ("Mixed")?
 
-6. Session Flow: which of these stages are clearly present in the transcript? {', '.join(SESSION_STAGES)}. List only the ones actually evidenced.
+6. Session Flow: which of these stages are clearly present in the recording? {', '.join(SESSION_STAGES)}. List only the ones actually evidenced, in stages_present; list the rest in stages_missing.
 
 7. Professionalism: rate "Excellent", "Good", "Fair", or "Poor" based on tone — flag rude language, sarcasm, impatience, arguments, or negative tone as issues.
 
-8. Technical Accuracy / Hallucination check: verify the technical correctness of anything the TA taught (code, SQL, DSA, concepts). Status is "Correct" or "Incorrect Guidance". If incorrect, give a confidence percentage (0-100) that the guidance was actually wrong, and explain what was wrong.
+8. Technical Accuracy / Hallucination check: verify the technical correctness of anything the TA taught (code, SQL, DSA, concepts). Status is "Correct" or "Incorrect Guidance". If incorrect, give a confidence percentage (0-100) that the guidance was actually wrong, and explain what was wrong in details.
 
 9. Student sentiment at the end of the session: "Satisfied", "Neutral", or "Dissatisfied".
 
-Return ONLY valid JSON, no markdown, no extra text, in exactly this shape:
-{{
-  "doubt_resolution":  {{ "status": "Fully Resolved"|"Partially Resolved"|"Not Resolved", "reasoning": "2-3 sentences" }},
-  "teaching_quality":  {{ "score": 1-5, "reasoning": "2-3 sentences" }},
-  "direct_solution":   {{ "classification": "Good"|"Warning"|"Violation", "evidence": "quote or description of what happened" }},
-  "communication":     {{ "score": 1-5, "issues": ["...", ...] }},
-  "concept_vs_answer": {{ "classification": "Concept-based"|"Mixed"|"Answer-based", "reasoning": "1-2 sentences" }},
-  "session_flow":      {{ "stages_present": ["subset of the stage list above"], "stages_missing": ["..."] }},
-  "professionalism":   {{ "rating": "Excellent"|"Good"|"Fair"|"Poor", "issues": ["...", ...] }},
-  "technical_accuracy":{{ "status": "Correct"|"Incorrect Guidance", "confidence_pct": 0-100, "details": "1-2 sentences" }},
-  "student_sentiment": "Satisfied"|"Neutral"|"Dissatisfied",
-  "summary": "3-5 sentence plain-English summary of what happened in the session",
-  "recommendations": ["actionable recommendation 1", "actionable recommendation 2"]
-}}"""
+Also include a 3-5 sentence plain-English summary of what happened, and a short list of actionable recommendations for the TA."""
 
-
-def analyze_session(api_key: str, transcript_text: str, stats: dict, screen_share_summary: str = None) -> dict:
-    client = Groq(api_key=api_key)
-    screen_line = (
-        f"Screen share summary: {screen_share_summary}"
-        if screen_share_summary else
-        "Screen share: not available for this session."
-    )
-    user_content = f"""Session duration: {stats['duration_minutes']} minutes
-TA speaking: {stats['ta_pct']}% | Student speaking: {stats['student_pct']}%
-Longest silence gap: {stats['max_gap_seconds']}s
-{screen_line}
-
-Transcript (timestamps in mm:ss):
-{transcript_text}
-
-Analyze this TA doubt-clearing session and return the JSON evaluation."""
-
-    response = client.chat.completions.create(
-        model=ANALYSIS_MODEL,
-        max_tokens=3000,
-        messages=[
-            {"role": "system", "content": MAIN_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    return json.loads(_strip_fences(response.choices[0].message.content))
-
-
-# ─── 5. Screen-share analysis (optional) ─────────────────────────────────────
-
-SCREEN_SHARE_SYSTEM_PROMPT = """You are reviewing a single screenshot sampled from the shared screen of a TA (teaching assistant) doubt-clearing session.
-
-Identify:
-- content_type: one of "coding_ide", "terminal", "browser", "leetcode_or_judge", "jupyter_notebook", "presentation_slides", "file_explorer", "other"
-- activity: one of "ta_writing_code", "student_writing_code", "explaining_debugging", "idle_or_static", "navigating_docs"
-- visible_code_or_query: OCR any code, SQL query, or written solution visible verbatim (empty string if none)
-- looks_like_final_solution: true if the visible content appears to be a complete, ready-to-submit final answer rather than a partial hint or in-progress work
-
-Return ONLY valid JSON, no markdown, no extra text:
-{"content_type": "...", "activity": "...", "visible_code_or_query": "...", "looks_like_final_solution": true|false}"""
-
-
-def _extract_sample_frames(video_path: str, out_dir: str, n_frames: int = 6) -> list:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video for screen-share sampling: {video_path}")
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        cap.release()
-        raise RuntimeError("Video has no readable frames.")
-
-    frame_paths = []
-    for i in range(n_frames):
-        target = int(total_frames * (i / max(n_frames - 1, 1)))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        path = os.path.join(out_dir, f"screen_{i:02d}.jpg")
-        cv2.imwrite(path, frame)
-        frame_paths.append(path)
-    cap.release()
-    return frame_paths
-
-
-def analyze_screen_share(api_key: str, video_path: str, n_frames: int = 6) -> dict:
-    client = Groq(api_key=api_key)
-    with tempfile.TemporaryDirectory() as tmp:
-        frame_paths = _extract_sample_frames(video_path, tmp, n_frames)
-        frame_results = []
-        for fp in frame_paths:
-            image_data, media_type = load_image_file(Path(fp))
-            response = client.chat.completions.create(
-                model=VISION_MODEL,
-                max_tokens=800,
-                messages=[
-                    {"role": "system", "content": SCREEN_SHARE_SYSTEM_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
-                        {"type": "text", "text": "Classify this screen-share frame and return the JSON."},
-                    ]},
-                ],
-            )
-            try:
-                frame_results.append(json.loads(_strip_fences(response.choices[0].message.content)))
-            except (json.JSONDecodeError, IndexError):
-                continue
-
-    if not frame_results:
-        return None
-
-    content_counts = {}
-    for r in frame_results:
-        ct = r.get("content_type", "other")
-        content_counts[ct] = content_counts.get(ct, 0) + 1
-
-    any_final_solution = any(r.get("looks_like_final_solution") for r in frame_results)
-    code_evidence = [r["visible_code_or_query"] for r in frame_results if r.get("visible_code_or_query")]
-
-    classification = "Violation" if any_final_solution else ("Warning" if code_evidence else "Good")
-
-    return {
-        "frames_analyzed": len(frame_results),
-        "content_type_breakdown": content_counts,
-        "direct_solution_detected": any_final_solution,
-        "code_evidence": code_evidence[:5],
-        "classification": classification,
-    }
-
-
-# ─── 6. Chat analysis (optional — wire in once a chat-log source exists) ────
 
 CHAT_SYSTEM_PROMPT = """You are reviewing the chat log of a TA (teaching assistant) doubt-clearing session, separate from the voice transcript.
 
@@ -437,24 +256,59 @@ Detect:
 - hint_examples: good hint-style messages (e.g. "Try using GROUP BY", "Check your loop condition")
 - violation_examples: messages that directly hand over the solution (e.g. "SELECT * FROM Employees;", "Here is the entire solution")
 
-Return ONLY valid JSON, no markdown, no extra text:
-{"classification": "Good"|"Warning"|"Violation", "direct_code_or_sql": ["..."], "external_links": ["..."], "hint_examples": ["..."], "violation_examples": ["..."]}"""
+classification is "Good" if only hints were shared, "Warning" if borderline, "Violation" if a full solution was pasted."""
 
 
-def analyze_chat(api_key: str, chat_text: str) -> dict:
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model=LABEL_MODEL,
-        max_tokens=1200,
-        messages=[
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Chat log:\n{chat_text}\n\nAnalyze it and return the JSON."},
-        ],
+# ─── 4. Gemini plumbing ───────────────────────────────────────────────────────
+
+def _upload_and_wait(client: "genai.Client", video_path: str):
+    uploaded = client.files.upload(file=video_path)
+    waited = 0
+    while getattr(uploaded.state, "name", uploaded.state) == "PROCESSING":
+        if waited >= FILE_ACTIVE_TIMEOUT_SECONDS:
+            raise TimeoutError(f"Gemini file processing timed out after {FILE_ACTIVE_TIMEOUT_SECONDS}s")
+        time.sleep(FILE_ACTIVE_POLL_SECONDS)
+        waited += FILE_ACTIVE_POLL_SECONDS
+        uploaded = client.files.get(name=uploaded.name)
+
+    state = getattr(uploaded.state, "name", uploaded.state)
+    if state != "ACTIVE":
+        raise RuntimeError(f"Gemini file upload did not become ACTIVE (state={state})")
+    return uploaded
+
+
+def analyze_video_with_gemini(client: "genai.Client", video_path: str, analyze_screen: bool) -> SessionAnalysisResult:
+    uploaded = _upload_and_wait(client, video_path)
+    user_prompt = (
+        f"screen_share_analysis_requested: {'yes' if analyze_screen else 'no'}\n\n"
+        "Analyze this TA doubt-clearing session recording and return the JSON."
     )
-    return json.loads(_strip_fences(response.choices[0].message.content))
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[uploaded, user_prompt],
+        config=types.GenerateContentConfig(
+            system_instruction=COMBINED_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=SessionAnalysisResult,
+        ),
+    )
+    return SessionAnalysisResult.model_validate_json(response.text)
 
 
-# ─── 7. Weighted scoring (per PRD "Final Score" table) ──────────────────────
+def analyze_chat(client: "genai.Client", chat_text: str) -> dict:
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[f"Chat log:\n{chat_text}\n\nAnalyze it and return the JSON."],
+        config=types.GenerateContentConfig(
+            system_instruction=CHAT_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=ChatAnalysisResult,
+        ),
+    )
+    return ChatAnalysisResult.model_validate_json(response.text).model_dump()
+
+
+# ─── 5. Weighted scoring (per PRD "Final Score" table) ──────────────────────
 
 def _engagement_points(ta_pct: float) -> float:
     """Full 10 points inside the 50-70% TA-speaking band; falls off linearly outside it."""
@@ -496,10 +350,10 @@ def compute_final_score(analysis: dict, participation: dict) -> dict:
     return breakdown
 
 
-# ─── 8. AI flags (per PRD "AI Flags" section) ────────────────────────────────
+# ─── 6. AI flags (per PRD "AI Flags" section) ────────────────────────────────
 
 def build_flags(analysis: dict, participation: dict, dead_air: dict, duration_minutes: float,
-                 ai_confidence_pct: float, screen_share: dict = None,
+                 ai_confidence_pct: float, screen_share: Optional[dict] = None,
                  confidence_threshold: float = 60.0) -> list:
     flags = []
     if analysis["doubt_resolution"]["status"] != "Fully Resolved":
@@ -523,62 +377,47 @@ def build_flags(analysis: dict, participation: dict, dead_air: dict, duration_mi
     return flags
 
 
-# ─── 9. End-to-end orchestration ─────────────────────────────────────────────
+# ─── 7. End-to-end orchestration ─────────────────────────────────────────────
 
 def analyze_ta_session(api_key: str, video_path: str, analyze_screen: bool = True,
                         chat_text: str = None) -> dict:
     """Runs the full pipeline on one recording and returns a report dict ready
     for scoring output / PDF / CSV / JSON."""
-    with tempfile.TemporaryDirectory() as tmp:
-        audio_path = os.path.join(tmp, "audio.mp3")
-        extract_audio(video_path, audio_path)
-        duration = get_duration_seconds(audio_path)
-        raw_segments = transcribe_audio(api_key, audio_path)
-        transcription_confidence = estimate_transcription_confidence(raw_segments)
-        audio_quality = estimate_audio_quality(audio_path)
+    duration = get_duration_seconds(video_path)
+    audio_quality = estimate_audio_quality(video_path)
 
+    client = genai.Client(api_key=api_key)
+    result = analyze_video_with_gemini(client, video_path, analyze_screen)
+    data = result.model_dump()
+
+    raw_segments = data.pop("transcript_segments")
     if not raw_segments:
         raise RuntimeError("No speech detected in recording.")
-
-    merged = merge_segments(raw_segments)
-    labeled = label_speakers(api_key, merged)
+    labeled = [
+        {"start": s["start_sec"], "end": s["end_sec"], "speaker": s["speaker"], "text": s["text"]}
+        for s in raw_segments
+    ]
     participation = compute_participation(labeled)
     dead_air = compute_dead_air(labeled, duration)
     transcript_text = build_transcript_text(labeled)
 
-    screen_share = None
-    if analyze_screen:
-        try:
-            screen_share = analyze_screen_share(api_key, video_path)
-        except Exception:
-            screen_share = None  # screen-share analysis is best-effort/optional
+    transcription_confidence = data.pop("transcription_confidence_pct")
+    screen_share = data.pop("screen_share")
+    if not analyze_screen:
+        screen_share = None
 
-    screen_summary_text = None
-    if screen_share:
-        screen_summary_text = (
-            f"{screen_share['frames_analyzed']} frames sampled; "
-            f"content types seen: {screen_share['content_type_breakdown']}; "
-            f"possible final solution visible on screen: {screen_share['direct_solution_detected']}"
-        )
-
-    stats = {
-        "duration_minutes": round(duration / 60, 1),
-        "ta_pct": participation["ta_pct"],
-        "student_pct": participation["student_pct"],
-        "max_gap_seconds": dead_air["max_gap_seconds"],
-    }
-
-    analysis = analyze_session(api_key, transcript_text, stats, screen_summary_text)
+    analysis = data  # remaining keys match the original `analysis` contract
 
     chat_analysis = None
     if chat_text:
         try:
-            chat_analysis = analyze_chat(api_key, chat_text)
+            chat_analysis = analyze_chat(client, chat_text)
         except Exception:
-            chat_analysis = None
+            chat_analysis = None  # chat analysis is best-effort/optional
 
+    duration_minutes = round(duration / 60, 1)
     score_breakdown = compute_final_score(analysis, participation)
-    flags = build_flags(analysis, participation, dead_air, stats["duration_minutes"],
+    flags = build_flags(analysis, participation, dead_air, duration_minutes,
                          transcription_confidence, screen_share)
     if audio_quality.get("quality_flag"):
         flags.append(audio_quality["quality_flag"])
@@ -587,7 +426,7 @@ def analyze_ta_session(api_key: str, video_path: str, analyze_screen: bool = Tru
             flags.append("Direct solution shared")
 
     return {
-        "duration_minutes": stats["duration_minutes"],
+        "duration_minutes": duration_minutes,
         "participation": participation,
         "dead_air": dead_air,
         "audio_quality": audio_quality,

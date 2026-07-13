@@ -10,6 +10,8 @@ env/
 *.json
 *.csv
 *.xlsx
+reports/
+ta_reports/
 
 # API keys / secrets
 .env
