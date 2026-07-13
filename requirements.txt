@@ -8,6 +8,7 @@ fpdf2>=2.7.0
 opencv-python-headless>=4.9.0
 requests>=2.31.0
 
-# TA Session Analyzer (ta_core.py / ta_session_analyzer.py) — Gemini instead of Groq
+# TA Session Analyzer (ta_core.py / ta_session_analyzer.py / ta_app.py) — Gemini instead of Groq
 google-genai>=0.3.0
 pydantic>=2.0.0
+pandas>=2.0.0

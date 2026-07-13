@@ -70,7 +70,8 @@ MAX_RETRIES = 3
 # Process one session end-to-end
 # ---------------------------------------------------------------------------
 
-def process_session(row: dict, run_date: str) -> dict:
+def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
+    api_key = api_key or GEMINI_API_KEY
     session_id = row["session_id"]
     ta_name = row.get("ta_name", "")
     student_name = row.get("student_name", "")
@@ -100,7 +101,7 @@ def process_session(row: dict, run_date: str) -> dict:
             try:
                 print(f"[{session_id}] analyzing (attempt {attempt})...")
                 report = analyze_ta_session(
-                    GEMINI_API_KEY, tmp_video,
+                    api_key, tmp_video,
                     analyze_screen=analyze_screen, chat_text=chat_text,
                 )
                 break
@@ -120,12 +121,14 @@ def process_session(row: dict, run_date: str) -> dict:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     slug = f"{ta_name}_{session_id}".replace(" ", "-").replace("/", "-")
 
+    pdf_path = os.path.join(OUTPUT_DIR, f"{slug}.pdf")
     try:
         pdf_bytes = generate_ta_pdf(session_meta, report)
-        with open(os.path.join(OUTPUT_DIR, f"{slug}.pdf"), "wb") as f:
+        with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
     except Exception as e:
         print(f"[{session_id}] PDF generation failed: {e}")
+        pdf_path = None
 
     with open(os.path.join(OUTPUT_DIR, f"{slug}.json"), "w", encoding="utf-8") as f:
         json.dump({
@@ -148,6 +151,7 @@ def process_session(row: dict, run_date: str) -> dict:
         "ta_speaking_pct": report["participation"]["ta_pct"],
         "student_speaking_pct": report["participation"]["student_pct"],
         "flags": report["flags"],
+        "pdf_path": pdf_path,
     }
 
 
