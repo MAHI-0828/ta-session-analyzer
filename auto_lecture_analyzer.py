@@ -178,13 +178,15 @@ def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
             print(f"[{session_id}] PDF generation failed: {e}")
             pdf_path = None
 
+        csv_path = os.path.join(OUTPUT_DIR, f"{slug}.csv")
         csv_rows = build_csv_rows(batch, module, frame_results)
-        with open(os.path.join(OUTPUT_DIR, f"{slug}.csv"), "w", newline="") as f:
+        with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
             writer.writeheader()
             writer.writerows(csv_rows)
 
-        with open(os.path.join(OUTPUT_DIR, f"{slug}.json"), "w") as f:
+        json_path = os.path.join(OUTPUT_DIR, f"{slug}.json")
+        with open(json_path, "w") as f:
             json.dump({
                 "batch_name": batch, "lecture_module": module,
                 "session_id": session_id, "analyzed_at": run_date,
@@ -201,6 +203,8 @@ def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
             "overall_score": overall,
             "flagged_below_3_5": flagged,
             "pdf_path": pdf_path,
+            "csv_path": csv_path,
+            "json_path": json_path,
         }
         # tmp dir (video + frames) is auto-deleted on exit
 

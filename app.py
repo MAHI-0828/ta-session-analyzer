@@ -378,25 +378,36 @@ with tab_batch:
         st.success(f"{len(results)} succeeded, {len(errors)} failed.")
 
         if results:
+            path_keys = ("pdf_path", "csv_path", "json_path")
             display_rows = []
             for r in results:
-                row = {k: v for k, v in r.items() if k not in ("pdf_path", "flagged_below_3_5")}
+                row = {k: v for k, v in r.items() if k not in path_keys and k != "flagged_below_3_5"}
                 row["flagged_params"] = "; ".join(r.get("flagged_below_3_5", {}).keys()) or "none"
                 display_rows.append(row)
             display_df = pd.DataFrame(display_rows)
             st.dataframe(display_df, use_container_width=True)
 
             rollup_csv = display_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download rollup CSV", rollup_csv,
+            st.download_button("Download rollup CSV (overview)", rollup_csv,
                                 file_name=f"lecture_rollup_{datetime.now().strftime('%Y%m%d')}.csv")
 
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w") as zf:
-                for r in results:
-                    if r.get("pdf_path") and os.path.exists(r["pdf_path"]):
-                        zf.write(r["pdf_path"], arcname=os.path.basename(r["pdf_path"]))
-            st.download_button("Download all PDFs (zip)", buf.getvalue(),
-                                file_name="lecture_reports.zip", mime="application/zip")
+            def zip_of(path_key: str) -> bytes:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w") as zf:
+                    for r in results:
+                        path = r.get(path_key)
+                        if path and os.path.exists(path):
+                            zf.write(path, arcname=os.path.basename(path))
+                return buf.getvalue()
+
+            st.markdown("**Download by file format** — one zip per format, all sessions together")
+            zcol1, zcol2, zcol3 = st.columns(3)
+            zcol1.download_button("All PDFs (zip)", zip_of("pdf_path"),
+                                   file_name="lecture_pdfs.zip", mime="application/zip")
+            zcol2.download_button("All CSVs (zip)", zip_of("csv_path"),
+                                   file_name="lecture_csvs.zip", mime="application/zip")
+            zcol3.download_button("All JSONs (zip)", zip_of("json_path"),
+                                   file_name="lecture_jsons.zip", mime="application/zip")
 
         if errors:
             st.error("Failures:")
