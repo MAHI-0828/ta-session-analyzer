@@ -24,7 +24,7 @@ Requirements (on top of requirements.txt):
     pip install opencv-python-headless requests
 
 Run manually:
-    GROQ_API_KEY=your_key python auto_lecture_analyzer.py recordings_today.csv
+    GEMINI_API_KEY=your_key python auto_lecture_analyzer.py recordings_today.csv
 
 Automate daily (see bottom of file for scheduling notes).
 """
@@ -52,7 +52,7 @@ from recording_utils import extract_video_url, download_video
 # CONFIG — adjust these to match your setup
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # never hardcode this
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # never hardcode this
 FRAMES_PER_VIDEO = 8          # app caps uploads at 10 screenshots; 8 stays under that
 SKIP_INTRO_OUTRO_PCT = 0.03   # skip first/last 3% of the video (title/goodbye slides)
 OUTPUT_DIR = "reports"
@@ -102,13 +102,13 @@ def extract_frames(video_path: str, out_dir: str, n_frames: int = FRAMES_PER_VID
 # 3. Score frames — reuses core.analyze_image() exactly as app.py/analyze.py do
 # ---------------------------------------------------------------------------
 
-def score_frame(image_path: str, session_id: str, frame_index: int) -> dict:
+def score_frame(image_path: str, session_id: str, frame_index: int, api_key: str) -> dict:
     image_data, media_type = load_image_file(Path(image_path))
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            result = analyze_image(GROQ_API_KEY, image_data, media_type)
+            result = analyze_image(api_key, image_data, media_type)
             result["screenshot"] = f"{session_id}_frame_{frame_index:02d}.jpg"
             result["analyzed_at"] = datetime.now().isoformat()
             return result
@@ -126,7 +126,8 @@ def score_frame(image_path: str, session_id: str, frame_index: int) -> dict:
 # 4. Process one session end-to-end
 # ---------------------------------------------------------------------------
 
-def process_session(row: dict, run_date: str) -> dict:
+def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
+    api_key = api_key or GEMINI_API_KEY
     session_id = row["session_id"]
     batch = row.get("batch", "")
     module = row.get("module", "")
@@ -149,7 +150,7 @@ def process_session(row: dict, run_date: str) -> dict:
 
         print(f"[{session_id}] scoring {len(frame_paths)} frames...")
         frame_results = [
-            score_frame(fp, session_id, i) for i, fp in enumerate(frame_paths)
+            score_frame(fp, session_id, i, api_key) for i, fp in enumerate(frame_paths)
         ]
 
         # Session-level aggregation, same logic app.py uses for the Report Card
@@ -168,12 +169,14 @@ def process_session(row: dict, run_date: str) -> dict:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         slug = f"{batch}_{module}_{session_id}".replace(" ", "-").replace("/", "-")
 
+        pdf_path = os.path.join(OUTPUT_DIR, f"{slug}.pdf")
         try:
             pdf_bytes = generate_pdf(batch, module, frame_results)
-            with open(os.path.join(OUTPUT_DIR, f"{slug}.pdf"), "wb") as f:
+            with open(pdf_path, "wb") as f:
                 f.write(pdf_bytes)
         except Exception as e:
             print(f"[{session_id}] PDF generation failed: {e}")
+            pdf_path = None
 
         csv_rows = build_csv_rows(batch, module, frame_results)
         with open(os.path.join(OUTPUT_DIR, f"{slug}.csv"), "w", newline="") as f:
@@ -197,6 +200,7 @@ def process_session(row: dict, run_date: str) -> dict:
             "frame_count": len(frame_paths),
             "overall_score": overall,
             "flagged_below_3_5": flagged,
+            "pdf_path": pdf_path,
         }
         # tmp dir (video + frames) is auto-deleted on exit
 
@@ -206,8 +210,8 @@ def process_session(row: dict, run_date: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_daily_batch(csv_path: str):
-    if not GROQ_API_KEY:
-        raise EnvironmentError("Set GROQ_API_KEY as an environment variable before running.")
+    if not GEMINI_API_KEY:
+        raise EnvironmentError("Set GEMINI_API_KEY as an environment variable before running.")
 
     run_date = datetime.now().strftime("%Y-%m-%d")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -257,7 +261,7 @@ if __name__ == "__main__":
 #
 # Linux/Mac (cron) — runs every day at 8 PM:
 #   crontab -e
-#   0 20 * * * cd "/path/to/Lecture analyzer" && GROQ_API_KEY=xxx /usr/bin/python3 auto_lecture_analyzer.py recordings_today.csv >> logs/run.log 2>&1
+#   0 20 * * * cd "/path/to/Lecture analyzer" && GEMINI_API_KEY=xxx /usr/bin/python3 auto_lecture_analyzer.py recordings_today.csv >> logs/run.log 2>&1
 #
 # Windows (Task Scheduler):
 #   1. Task Scheduler > Create Basic Task > Daily, pick a time
@@ -265,8 +269,14 @@ if __name__ == "__main__":
 #      Program: python.exe
 #      Arguments: auto_lecture_analyzer.py recordings_today.csv
 #      Start in: the lecture-analyzer folder
-#   3. Set GROQ_API_KEY as a permanent environment variable (System Properties >
+#   3. Set GEMINI_API_KEY as a permanent environment variable (System Properties >
 #      Environment Variables) so the scheduled task can see it.
+#
+# Whatever you automate this with, remember why the old cron pipeline in the
+# separate lecture-analyzer repo got retired: unattended runs with no
+# per-session checkpointing can lose a whole batch to one stuck call. Prefer
+# something that watches progress (like the Batch tab in app.py) over a truly
+# unattended job, or add incremental writeback if you do automate it.
 #
 # Either way, recordings_today.csv needs to be updated with that day's
 # recording links before the scheduled time runs (e.g. export it from your

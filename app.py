@@ -1,8 +1,11 @@
 import io
+import os
 import csv
 import json
+import zipfile
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 
 from core import (
@@ -11,6 +14,16 @@ from core import (
     build_csv_rows, aggregate_scores,
 )
 from pdf_report import generate_pdf
+from auto_lecture_analyzer import process_session
+
+
+def _get_secret(name: str, default: str = "") -> str:
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
 
 # ─── Page config ─────────────────────────────────────────────────────────────────
 
@@ -75,115 +88,8 @@ def build_csv_bytes(batch, module, results):
     return buf.getvalue().encode("utf-8")
 
 
-# ─── Header ──────────────────────────────────────────────────────────────────────
-
-st.title("🎓 Lecture Quality Analyzer")
-st.caption("Upload screenshots from a recorded lecture and get a scored report across 16 visual quality parameters.")
-
-st.divider()
-
-# ─── Inputs ──────────────────────────────────────────────────────────────────────
-
-col_l, col_r = st.columns([1, 2])
-
-with col_l:
-    st.subheader("Session Details")
-    batch_name = st.text_input("Batch Name", placeholder="e.g. DS-Batch-12")
-    lecture_module = st.text_input("Lecture Module", placeholder="e.g. Module-3-SQL-Joins")
-    api_key = st.text_input(
-        "Groq API Key",
-        type="password",
-        placeholder="gsk_... (or set GROQ_API_KEY env var)",
-    )
-    st.caption("Free key from console.groq.com — never stored.")
-
-with col_r:
-    st.subheader("Upload Screenshots")
-    uploaded_files = st.file_uploader(
-        "Drop up to 10 screenshots (PNG / JPG / WEBP)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-    )
-    if uploaded_files:
-        st.caption(f"{len(uploaded_files)} file(s) selected")
-        preview_cols = st.columns(min(len(uploaded_files), 5))
-        for i, f in enumerate(uploaded_files[:5]):
-            with preview_cols[i]:
-                st.image(f, use_container_width=True, caption=f.name)
-        if len(uploaded_files) > 5:
-            st.caption(f"+ {len(uploaded_files) - 5} more not shown in preview")
-
-st.divider()
-
-# ─── Analyze button ──────────────────────────────────────────────────────────────
-
-ready = batch_name and lecture_module and uploaded_files
-analyze_btn = st.button("Analyze Screenshots", type="primary", disabled=not ready)
-
-if not ready and not analyze_btn:
-    missing = []
-    if not batch_name:       missing.append("Batch Name")
-    if not lecture_module:   missing.append("Lecture Module")
-    if not uploaded_files:   missing.append("at least one screenshot")
-    if missing:
-        st.info(f"Fill in: {', '.join(missing)}")
-
-# ─── Analysis ────────────────────────────────────────────────────────────────────
-
-if analyze_btn and ready:
-    st.session_state.pop("report", None)  # clear previous report on new analysis
-
-if analyze_btn and ready:
-    import os
-    key = api_key or os.environ.get("GROQ_API_KEY", "")
-    if not key:
-        st.error("No API key provided. Enter it above or set the GROQ_API_KEY environment variable.")
-        st.stop()
-
-    results = []
-
-    progress_bar = st.progress(0, text="Starting analysis...")
-    status_area  = st.empty()
-
-    for i, uploaded_file in enumerate(uploaded_files):
-        status_area.markdown(f"Analyzing **{uploaded_file.name}** ({i+1}/{len(uploaded_files)})…")
-        try:
-            file_bytes = uploaded_file.read()
-            image_data, media_type = load_image_bytes(file_bytes, uploaded_file.name)
-            result = analyze_image(key, image_data, media_type)
-            result["screenshot"]  = uploaded_file.name
-            result["analyzed_at"] = datetime.now().isoformat()
-            results.append(result)
-        except Exception as e:
-            st.warning(f"Skipped {uploaded_file.name}: {e}")
-        progress_bar.progress((i + 1) / len(uploaded_files),
-                               text=f"Analyzed {i+1}/{len(uploaded_files)}")
-
-    status_area.empty()
-    progress_bar.empty()
-
-    if not results:
-        st.error("Analysis failed for all screenshots.")
-        st.stop()
-
-    # Persist results so downloading a file doesn't reset the page
-    st.session_state["report"] = {
-        "results":  results,
-        "batch":    batch_name,
-        "module":   lecture_module,
-    }
-
-# Show report if results exist (survives download button reruns)
-if "report" in st.session_state:
-    results     = st.session_state["report"]["results"]
-    batch_name  = st.session_state["report"]["batch"]
-    lecture_module = st.session_state["report"]["module"]
-
-    st.success(f"Done! Analyzed {len(results)} screenshot(s).")
-    st.divider()
-
-    # ── Report card ──────────────────────────────────────────────────────────────
-
+def render_report(results, batch_name, lecture_module):
+    """Renders the full Report Card + per-screenshot breakdown + downloads for one session's results."""
     st.subheader("📊 Report Card")
     averages = aggregate_scores(results)
     overall_scores = [r["overall_score"] for r in results
@@ -319,3 +225,179 @@ if "report" in st.session_state:
         file_name=f"{base_name}.json",
         mime="application/json",
     )
+
+
+# ─── Header ──────────────────────────────────────────────────────────────────────
+
+st.title("🎓 Lecture Quality Analyzer")
+st.caption("Score recorded-lecture screenshots (or a whole day's recordings) across 14 visual quality parameters.")
+
+with st.sidebar:
+    st.subheader("Settings")
+    GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
+    if GEMINI_API_KEY:
+        st.success("Gemini API key loaded from server config.")
+    else:
+        GEMINI_API_KEY = st.text_input("Gemini API key", type="password",
+                                        help="Free key: aistudio.google.com")
+        st.caption("Key is used for this session only — never stored or logged.")
+
+st.divider()
+
+tab_single, tab_batch = st.tabs(["Single Session", "Batch (CSV)"])
+
+# ─── Single Session ────────────────────────────────────────────────────────────
+
+with tab_single:
+    st.caption("Upload screenshots from a recorded lecture and get a scored report.")
+
+    col_l, col_r = st.columns([1, 2])
+
+    with col_l:
+        st.subheader("Session Details")
+        batch_name = st.text_input("Batch Name", placeholder="e.g. DS-Batch-12")
+        lecture_module = st.text_input("Lecture Module", placeholder="e.g. Module-3-SQL-Joins")
+
+    with col_r:
+        st.subheader("Upload Screenshots")
+        uploaded_files = st.file_uploader(
+            "Drop up to 10 screenshots (PNG / JPG / WEBP)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+        )
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} file(s) selected")
+            preview_cols = st.columns(min(len(uploaded_files), 5))
+            for i, f in enumerate(uploaded_files[:5]):
+                with preview_cols[i]:
+                    st.image(f, use_container_width=True, caption=f.name)
+            if len(uploaded_files) > 5:
+                st.caption(f"+ {len(uploaded_files) - 5} more not shown in preview")
+
+    st.divider()
+
+    # ── Analyze button ──────────────────────────────────────────────────────────
+
+    ready = batch_name and lecture_module and uploaded_files
+    analyze_btn = st.button("Analyze Screenshots", type="primary",
+                             disabled=not (ready and GEMINI_API_KEY))
+
+    if not GEMINI_API_KEY:
+        st.info("Enter a Gemini API key in the sidebar to analyze.")
+    elif not ready and not analyze_btn:
+        missing = []
+        if not batch_name:       missing.append("Batch Name")
+        if not lecture_module:   missing.append("Lecture Module")
+        if not uploaded_files:   missing.append("at least one screenshot")
+        if missing:
+            st.info(f"Fill in: {', '.join(missing)}")
+
+    # ── Analysis ─────────────────────────────────────────────────────────────────
+
+    if analyze_btn and ready:
+        st.session_state.pop("report", None)  # clear previous report on new analysis
+
+        results = []
+
+        progress_bar = st.progress(0, text="Starting analysis...")
+        status_area  = st.empty()
+
+        for i, uploaded_file in enumerate(uploaded_files):
+            status_area.markdown(f"Analyzing **{uploaded_file.name}** ({i+1}/{len(uploaded_files)})…")
+            try:
+                file_bytes = uploaded_file.read()
+                image_data, media_type = load_image_bytes(file_bytes, uploaded_file.name)
+                result = analyze_image(GEMINI_API_KEY, image_data, media_type)
+                result["screenshot"]  = uploaded_file.name
+                result["analyzed_at"] = datetime.now().isoformat()
+                results.append(result)
+            except Exception as e:
+                st.warning(f"Skipped {uploaded_file.name}: {e}")
+            progress_bar.progress((i + 1) / len(uploaded_files),
+                                   text=f"Analyzed {i+1}/{len(uploaded_files)}")
+
+        status_area.empty()
+        progress_bar.empty()
+
+        if not results:
+            st.error("Analysis failed for all screenshots.")
+            st.stop()
+
+        # Persist results so downloading a file doesn't reset the page
+        st.session_state["report"] = {
+            "results":  results,
+            "batch":    batch_name,
+            "module":   lecture_module,
+        }
+
+    # Show report if results exist (survives download button reruns)
+    if "report" in st.session_state:
+        results     = st.session_state["report"]["results"]
+        batch_name  = st.session_state["report"]["batch"]
+        lecture_module = st.session_state["report"]["module"]
+
+        st.success(f"Done! Analyzed {len(results)} screenshot(s).")
+        st.divider()
+        render_report(results, batch_name, lecture_module)
+
+# ─── Batch (CSV) ────────────────────────────────────────────────────────────────
+
+with tab_batch:
+    st.caption("Score a whole day's recordings from a CSV manifest — downloads each video, "
+               "samples frames, and scores them the same way as Single Session.")
+    st.caption("Columns: recording_url, batch, module, session_id")
+
+    csv_file = st.file_uploader("Upload sessions CSV", type=["csv"], key="batch_csv")
+
+    if not GEMINI_API_KEY:
+        st.info("Enter a Gemini API key in the sidebar to run a batch.")
+
+    if csv_file and st.button("Run batch", type="primary", disabled=not GEMINI_API_KEY):
+        df_in = pd.read_csv(csv_file, dtype=str).fillna("")
+        rows = df_in.to_dict("records")
+        run_date = datetime.now().strftime("%Y-%m-%d")
+
+        progress = st.progress(0.0)
+        status = st.empty()
+        results, errors = [], []
+        for i, row in enumerate(rows):
+            status.write(f"Processing `{row.get('session_id', i)}` ({i + 1}/{len(rows)})...")
+            try:
+                results.append(process_session(row, run_date, api_key=GEMINI_API_KEY))
+            except Exception as e:
+                errors.append({"session_id": row.get("session_id", "?"), "error": str(e)})
+            progress.progress((i + 1) / len(rows))
+        status.write("Done.")
+
+        st.session_state["lecture_batch_results"] = results
+        st.session_state["lecture_batch_errors"] = errors
+
+    if "lecture_batch_results" in st.session_state:
+        results = st.session_state["lecture_batch_results"]
+        errors = st.session_state["lecture_batch_errors"]
+        st.success(f"{len(results)} succeeded, {len(errors)} failed.")
+
+        if results:
+            display_rows = []
+            for r in results:
+                row = {k: v for k, v in r.items() if k not in ("pdf_path", "flagged_below_3_5")}
+                row["flagged_params"] = "; ".join(r.get("flagged_below_3_5", {}).keys()) or "none"
+                display_rows.append(row)
+            display_df = pd.DataFrame(display_rows)
+            st.dataframe(display_df, use_container_width=True)
+
+            rollup_csv = display_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download rollup CSV", rollup_csv,
+                                file_name=f"lecture_rollup_{datetime.now().strftime('%Y%m%d')}.csv")
+
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                for r in results:
+                    if r.get("pdf_path") and os.path.exists(r["pdf_path"]):
+                        zf.write(r["pdf_path"], arcname=os.path.basename(r["pdf_path"]))
+            st.download_button("Download all PDFs (zip)", buf.getvalue(),
+                                file_name="lecture_reports.zip", mime="application/zip")
+
+        if errors:
+            st.error("Failures:")
+            st.dataframe(pd.DataFrame(errors), use_container_width=True)

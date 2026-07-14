@@ -1,14 +1,15 @@
 # Also requires ffmpeg + ffprobe on PATH (system install, not pip) — used for
 # video/audio frame extraction across analyze.py, auto_lecture_analyzer.py,
 # and ta_session_analyzer.py. macOS: brew install ffmpeg
-groq>=0.9.0
 streamlit>=1.35.0
 pillow>=10.0.0
 fpdf2>=2.7.0
 opencv-python-headless>=4.9.0
 requests>=2.31.0
+pandas>=2.0.0
 
-# TA Session Analyzer (ta_core.py / ta_session_analyzer.py / ta_app.py) — Gemini instead of Groq
+# TA Session Analyzer (ta_core.py / ta_session_analyzer.py / ta_app.py) — video
+# understanding via the Gemini Files API, separate from core.py's per-frame
+# Gemini image scoring used by the lecture analyzer.
 google-genai>=0.3.0
 pydantic>=2.0.0
-pandas>=2.0.0
