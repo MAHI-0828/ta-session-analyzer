@@ -10,8 +10,9 @@ Two modes:
 
 Secrets (Streamlit Cloud: app settings -> Secrets. Locally: create
 .streamlit/secrets.toml — it's gitignored, never commit it):
-    GEMINI_API_KEY = "..."   # shared team key, used if no key is entered
-    APP_PASSWORD   = "..."   # optional — gates the whole app if set
+    GEMINI_API_KEY   = "..."   # shared team key, used if no key is entered
+    DEEPGRAM_API_KEY = "..."   # transcription/diarization — console.deepgram.com
+    APP_PASSWORD     = "..."   # optional — gates the whole app if set
 
 Run locally:
     streamlit run ta_app.py
@@ -64,6 +65,7 @@ if not _require_password():
     st.stop()
 
 GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
+DEEPGRAM_API_KEY = _get_secret("DEEPGRAM_API_KEY")
 
 st.title("📋 TA Session Analyzer")
 st.caption("Internal tool — scores TA doubt-clearing session recordings against the quality rubric.")
@@ -75,6 +77,13 @@ with st.sidebar:
     else:
         GEMINI_API_KEY = st.text_input("Gemini API key", type="password",
                                         help="Free key: aistudio.google.com")
+        st.caption("Key is used for this session only — never stored or logged.")
+
+    if DEEPGRAM_API_KEY:
+        st.success("Deepgram API key loaded from server config.")
+    else:
+        DEEPGRAM_API_KEY = st.text_input("Deepgram API key", type="password",
+                                          help="Free key: console.deepgram.com — used for transcription/diarization.")
         st.caption("Key is used for this session only — never stored or logged.")
 
 
@@ -155,7 +164,7 @@ with tab_single:
     if chat_file:
         chat_text = chat_file.read().decode("utf-8", errors="ignore")
 
-    if st.button("Analyze session", type="primary", disabled=not GEMINI_API_KEY):
+    if st.button("Analyze session", type="primary", disabled=not (GEMINI_API_KEY and DEEPGRAM_API_KEY)):
         if not session_id:
             st.error("Session ID is required.")
         elif input_mode == "Recording URL" and not url_value:
@@ -175,7 +184,7 @@ with tab_single:
                                 f.write(uploaded_video.read())
 
                         report = analyze_ta_session(
-                            GEMINI_API_KEY, video_path,
+                            GEMINI_API_KEY, video_path, DEEPGRAM_API_KEY,
                             analyze_screen=analyze_screen, chat_text=chat_text,
                         )
                 st.session_state["last_report"] = report
@@ -197,7 +206,7 @@ with tab_batch:
     st.caption("Columns: recording_url, ta_name, student_name, session_id, analyze_screen (yes/no), chat_log_path (leave blank)")
     csv_file = st.file_uploader("Upload sessions CSV", type=["csv"], key="batch_csv")
 
-    if csv_file and st.button("Run batch", type="primary", disabled=not GEMINI_API_KEY):
+    if csv_file and st.button("Run batch", type="primary", disabled=not (GEMINI_API_KEY and DEEPGRAM_API_KEY)):
         df_in = pd.read_csv(csv_file, dtype=str).fillna("")
         rows = df_in.to_dict("records")
         run_date = datetime.now().strftime("%Y-%m-%d")
@@ -208,7 +217,8 @@ with tab_batch:
         for i, row in enumerate(rows):
             status.write(f"Processing `{row.get('session_id', i)}` ({i + 1}/{len(rows)})...")
             try:
-                results.append(process_session(row, run_date, api_key=GEMINI_API_KEY))
+                results.append(process_session(row, run_date, api_key=GEMINI_API_KEY,
+                                                deepgram_api_key=DEEPGRAM_API_KEY))
             except Exception as e:
                 errors.append({"session_id": row.get("session_id", "?"), "error": str(e)})
             progress.progress((i + 1) / len(rows))

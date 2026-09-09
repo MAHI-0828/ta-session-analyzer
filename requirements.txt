@@ -8,8 +8,11 @@ opencv-python-headless>=4.9.0
 requests>=2.31.0
 pandas>=2.0.0
 
-# TA Session Analyzer (ta_core.py / ta_session_analyzer.py / ta_app.py) — video
-# understanding via the Gemini Files API, separate from core.py's per-frame
-# Gemini image scoring used by the lecture analyzer.
+# TA Session Analyzer (ta_core.py / ta_session_analyzer.py / ta_app.py) —
+# Deepgram (via plain REST calls over `requests`, above) transcribes +
+# diarizes the recording, then Gemini scores the rubric from the transcript
+# plus a few sampled screenshots. Separate from core.py's per-frame Gemini
+# image scoring used by the lecture analyzer. Needs a GEMINI_API_KEY and a
+# DEEPGRAM_API_KEY (free credits: console.deepgram.com).
 google-genai>=0.3.0
 pydantic>=2.0.0

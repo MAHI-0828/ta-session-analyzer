@@ -2,26 +2,36 @@
 Core analysis engine for the TA Session Analyzer.
 
 Pipeline:
-    Recording -> upload to Gemini Files API -> single multimodal call that
-    transcribes + diarizes (TA vs Student) + reads the shared screen + scores
-    the session against the rubric -> local participation/dead-air math ->
-    weighted scorecard + report.
+    Recording -> Deepgram prerecorded API transcribes + diarizes it (speaker
+    labels come back generic: "0", "1", ...) -> a handful of evenly-spaced
+    screenshots are pulled from the shared screen -> one Gemini call maps the
+    generic speakers to TA/Student and scores the session against the rubric
+    using the transcript + screenshots -> local participation/dead-air math
+    -> weighted scorecard + report.
 
-Provider note: this pipeline runs on the Gemini API (free tier) instead of
-Groq. Gemini watches the actual video (voices + shared screen together)
-rather than diarizing from a text transcript alone, which is materially more
-reliable for telling TA and student apart — worth it given this tool targets
-single-TA/single-student calls with natural English/Hindi code-switching.
+Provider note: transcription/diarization runs on Deepgram (nova-2,
+prerecorded API) instead of Gemini. Gemini is only asked to do the judgment
+calls — who's the TA, is the shared screen a violation, rubric scoring —
+from the transcript text plus a few sampled screenshots, instead of
+ingesting the whole video. That's both cheaper (no full-video multimodal
+call) and lets Deepgram's free transcription credits absorb the most
+expensive part of the pipeline while Gemini quota is spent only on analysis.
+Trade-off: TA/Student attribution now comes from conversational content
+alone (who explains vs. who asks) rather than voice + visual cues together,
+so it's worth spot-checking on calls with unusual dynamics.
 The rest of the codebase (app.py, analyze.py, core.py, auto_lecture_analyzer.py)
-is untouched and still runs on Groq.
+is untouched and still runs on Gemini per-frame image scoring.
 """
 
 import json
+import mimetypes
 import os
+import re
 import subprocess
-import time
+import tempfile
 from typing import List, Literal, Optional
 
+import requests
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -56,8 +66,13 @@ SESSION_STAGES = [
 # both are free-tier eligible as of mid-2026.
 GEMINI_MODEL = "gemini-3.5-flash"
 
-FILE_ACTIVE_POLL_SECONDS = 3
-FILE_ACTIVE_TIMEOUT_SECONDS = 180
+DEEPGRAM_MODEL = "nova-2"
+DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
+
+# How many evenly-spaced screenshots to pull from the shared screen for
+# Gemini to look at — enough to catch a solution left on screen without
+# paying full-video multimodal token costs.
+SCREEN_FRAME_COUNT = 8
 
 
 def fmt_ts(seconds: float) -> str:
@@ -88,6 +103,28 @@ def estimate_audio_quality(media_path: str) -> dict:
     if mean_vol is not None and mean_vol < -35:
         quality_flag = "Low average audio volume detected — possible poor microphone or distance from mic."
     return {"mean_volume_db": mean_vol, "quality_flag": quality_flag}
+
+
+def sample_screen_frames(video_path: str, duration: float, count: int = SCREEN_FRAME_COUNT) -> List[bytes]:
+    """Pull `count` evenly-spaced JPEG frames from the recording so Gemini can
+    look at the shared screen without ingesting the full video."""
+    if duration <= 0 or count <= 0:
+        return []
+    frames = []
+    interval = duration / (count + 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        for i in range(1, count + 1):
+            ts = interval * i
+            out_path = os.path.join(tmp, f"frame_{i}.jpg")
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", video_path,
+                 "-frames:v", "1", "-q:v", "3", out_path],
+                capture_output=True,
+            )
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    frames.append(f.read())
+    return frames
 
 
 def compute_participation(labeled_segments: list) -> dict:
@@ -132,13 +169,70 @@ def build_transcript_text(labeled_segments: list) -> str:
     )
 
 
-# ─── 2. Gemini response schemas ──────────────────────────────────────────────
+def build_generic_transcript_text(segments: list) -> str:
+    """Same formatting as build_transcript_text, but before TA/Student roles
+    have been assigned — used for the transcript we hand to Gemini."""
+    return "\n".join(
+        f"[{fmt_ts(seg['start'])}] Speaker {seg['speaker']}: {seg['text']}"
+        for seg in segments
+    )
 
-class TranscriptSegment(BaseModel):
-    start_sec: float
-    end_sec: float
-    speaker: Literal["TA", "Student"]
-    text: str
+
+# ─── 2. Deepgram transcription + diarization ─────────────────────────────────
+
+def transcribe_with_deepgram(api_key: str, media_path: str) -> dict:
+    """Sends the recording straight to Deepgram's prerecorded API — it reads
+    the audio out of the video container itself, no local extraction needed
+    — and returns diarized utterances plus an overall confidence score.
+    Speakers come back as generic integers (0, 1, ...); Gemini maps them to
+    TA/Student afterwards from the transcript content alone."""
+    mime = mimetypes.guess_type(media_path)[0] or "video/mp4"
+    with open(media_path, "rb") as f:
+        response = requests.post(
+            DEEPGRAM_ENDPOINT,
+            params={
+                "model": DEEPGRAM_MODEL,
+                "diarize": "true",
+                "punctuate": "true",
+                "smart_format": "true",
+                "utterances": "true",
+            },
+            headers={
+                "Authorization": f"Token {api_key}",
+                "Content-Type": mime,
+            },
+            data=f,
+            timeout=600,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    utterances = payload.get("results", {}).get("utterances") or []
+    segments = [
+        {
+            "start": u["start"],
+            "end": u["end"],
+            "speaker": str(u.get("speaker", 0)),
+            "text": u["transcript"].strip(),
+            "confidence": u.get("confidence", 0.0),
+        }
+        for u in utterances if u.get("transcript", "").strip()
+    ]
+    if not segments:
+        raise RuntimeError("No speech detected in recording.")
+    avg_confidence = sum(s["confidence"] for s in segments) / len(segments)
+    return {"segments": segments, "confidence_pct": round(avg_confidence * 100, 1)}
+
+
+def _normalize_speaker_label(label: str) -> str:
+    match = re.search(r"\d+", str(label))
+    return match.group(0) if match else str(label).strip()
+
+
+# ─── 3. Gemini response schemas ──────────────────────────────────────────────
+
+class SpeakerRoles(BaseModel):
+    ta_speaker_label: str
+    reasoning: str
 
 
 class ScreenShare(BaseModel):
@@ -191,8 +285,7 @@ class TechnicalAccuracy(BaseModel):
 
 
 class SessionAnalysisResult(BaseModel):
-    transcript_segments: List[TranscriptSegment]
-    transcription_confidence_pct: float
+    speaker_roles: SpeakerRoles
     screen_share: ScreenShare
     doubt_resolution: DoubtResolution
     teaching_quality: TeachingQuality
@@ -215,14 +308,14 @@ class ChatAnalysisResult(BaseModel):
     violation_examples: List[str]
 
 
-# ─── 3. Prompts ───────────────────────────────────────────────────────────────
+# ─── 4. Prompts ───────────────────────────────────────────────────────────────
 
-COMBINED_SYSTEM_PROMPT = f"""You are an expert instructional-quality reviewer analyzing a TA (teaching assistant) doubt-clearing session directly from its video recording (voices + shared screen together). The session may mix English and Hindi (Hinglish) — treat this as normal, not a quality issue.
+COMBINED_SYSTEM_PROMPT = f"""You are an expert instructional-quality reviewer analyzing a TA (teaching assistant) doubt-clearing session. You are given (a) an already-transcribed, speaker-diarized transcript produced by a separate speech-to-text service, using generic speaker labels like "Speaker 0", "Speaker 1", and (b) up to {SCREEN_FRAME_COUNT} evenly-spaced screenshots sampled from the shared screen during the call, if screen analysis was requested. The transcript's wording and timestamps are already final — do not alter them, just use them. The session may mix English and Hindi (Hinglish) — treat this as normal, not a quality issue.
 
-Step 1 — Transcribe and diarize the whole recording:
-Produce merged, coherent utterances (not word-by-word fragments). For each utterance give start_sec and end_sec (seconds from the start of the video, as numbers), the speaker, and the text. The TA is the one guiding, explaining concepts, asking clarifying/verification questions, and concluding the discussion. The student is the one describing their doubt, asking questions, and responding to explanations. If more than one non-TA voice appears, label all of them "Student". Use voice, visual cues (e.g. who is driving the shared screen), and conversational role together — do not rely on content alone. Also report transcription_confidence_pct (0-100): your own confidence in the transcript's accuracy, lower for unclear audio, heavy accents, overlapping speech, or long inaudible stretches.
+Step 1 — Identify who is the TA:
+Exactly one speaker label is the TA — the one guiding, explaining concepts, asking clarifying/verification questions, and concluding the discussion. The student is the one describing their doubt, asking questions, and responding to explanations. If more than one non-TA label appears, they are still collectively "the student". Return ta_speaker_label as exactly the label text as it appears in the transcript (e.g. "0"), with a short reasoning.
 
-Step 2 — Read the shared screen throughout the video:
+Step 2 — Read the shared-screen screenshots (if provided):
 Note what kind of content was shown (coding IDE, terminal, browser, LeetCode/judge, notebook, slides, file explorer, other), and whether any code/SQL/query visible on screen was a complete, ready-to-submit final solution rather than a partial hint. classification is "Good" if only hints/guidance were visible, "Warning" if borderline/near-complete help was shown, "Violation" if a complete final solution was shown on screen. If screen analysis was not requested for this session (see the user message), set classification to "Good", leave content_types_observed/code_or_query_evidence empty, and note in summary that screen analysis was skipped by request.
 
 Step 3 — Evaluate these dimensions using the transcript and the shared screen together:
@@ -259,33 +352,23 @@ Detect:
 classification is "Good" if only hints were shared, "Warning" if borderline, "Violation" if a full solution was pasted."""
 
 
-# ─── 4. Gemini plumbing ───────────────────────────────────────────────────────
+# ─── 5. Gemini plumbing ───────────────────────────────────────────────────────
 
-def _upload_and_wait(client: "genai.Client", video_path: str):
-    uploaded = client.files.upload(file=video_path)
-    waited = 0
-    while getattr(uploaded.state, "name", uploaded.state) == "PROCESSING":
-        if waited >= FILE_ACTIVE_TIMEOUT_SECONDS:
-            raise TimeoutError(f"Gemini file processing timed out after {FILE_ACTIVE_TIMEOUT_SECONDS}s")
-        time.sleep(FILE_ACTIVE_POLL_SECONDS)
-        waited += FILE_ACTIVE_POLL_SECONDS
-        uploaded = client.files.get(name=uploaded.name)
-
-    state = getattr(uploaded.state, "name", uploaded.state)
-    if state != "ACTIVE":
-        raise RuntimeError(f"Gemini file upload did not become ACTIVE (state={state})")
-    return uploaded
-
-
-def analyze_video_with_gemini(client: "genai.Client", video_path: str, analyze_screen: bool) -> SessionAnalysisResult:
-    uploaded = _upload_and_wait(client, video_path)
+def analyze_session_with_gemini(client: "genai.Client", transcript_text: str,
+                                 frames: List[bytes], analyze_screen: bool) -> SessionAnalysisResult:
+    screen_requested = analyze_screen and bool(frames)
     user_prompt = (
-        f"screen_share_analysis_requested: {'yes' if analyze_screen else 'no'}\n\n"
-        "Analyze this TA doubt-clearing session recording and return the JSON."
+        f"screen_share_analysis_requested: {'yes' if screen_requested else 'no'}\n\n"
+        f"Diarized transcript:\n{transcript_text}\n\n"
+        "Analyze this TA doubt-clearing session and return the JSON."
     )
+    contents = [user_prompt]
+    if screen_requested:
+        contents += [types.Part.from_bytes(data=frame, mime_type="image/jpeg") for frame in frames]
+
     response = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[uploaded, user_prompt],
+        contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=COMBINED_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -308,7 +391,7 @@ def analyze_chat(client: "genai.Client", chat_text: str) -> dict:
     return ChatAnalysisResult.model_validate_json(response.text).model_dump()
 
 
-# ─── 5. Weighted scoring (per PRD "Final Score" table) ──────────────────────
+# ─── 6. Weighted scoring (per PRD "Final Score" table) ──────────────────────
 
 def _engagement_points(ta_pct: float) -> float:
     """Full 10 points inside the 50-70% TA-speaking band; falls off linearly outside it."""
@@ -350,7 +433,7 @@ def compute_final_score(analysis: dict, participation: dict) -> dict:
     return breakdown
 
 
-# ─── 6. AI flags (per PRD "AI Flags" section) ────────────────────────────────
+# ─── 7. AI flags (per PRD "AI Flags" section) ────────────────────────────────
 
 def build_flags(analysis: dict, participation: dict, dead_air: dict, duration_minutes: float,
                  ai_confidence_pct: float, screen_share: Optional[dict] = None,
@@ -377,31 +460,40 @@ def build_flags(analysis: dict, participation: dict, dead_air: dict, duration_mi
     return flags
 
 
-# ─── 7. End-to-end orchestration ─────────────────────────────────────────────
+# ─── 8. End-to-end orchestration ─────────────────────────────────────────────
 
-def analyze_ta_session(api_key: str, video_path: str, analyze_screen: bool = True,
-                        chat_text: str = None) -> dict:
+def analyze_ta_session(gemini_api_key: str, video_path: str, deepgram_api_key: str,
+                        analyze_screen: bool = True, chat_text: str = None) -> dict:
     """Runs the full pipeline on one recording and returns a report dict ready
-    for scoring output / PDF / CSV / JSON."""
+    for scoring output / PDF / CSV / JSON. Transcription + diarization run on
+    Deepgram; Gemini only maps speakers to TA/Student and scores the rubric."""
     duration = get_duration_seconds(video_path)
     audio_quality = estimate_audio_quality(video_path)
 
-    client = genai.Client(api_key=api_key)
-    result = analyze_video_with_gemini(client, video_path, analyze_screen)
+    transcript = transcribe_with_deepgram(deepgram_api_key, video_path)
+    segments = transcript["segments"]
+    transcription_confidence = transcript["confidence_pct"]
+    generic_transcript_text = build_generic_transcript_text(segments)
+
+    frames = sample_screen_frames(video_path, duration) if analyze_screen else []
+
+    client = genai.Client(api_key=gemini_api_key)
+    result = analyze_session_with_gemini(client, generic_transcript_text, frames, analyze_screen)
     data = result.model_dump()
 
-    raw_segments = data.pop("transcript_segments")
-    if not raw_segments:
-        raise RuntimeError("No speech detected in recording.")
+    ta_label = _normalize_speaker_label(data.pop("speaker_roles")["ta_speaker_label"])
     labeled = [
-        {"start": s["start_sec"], "end": s["end_sec"], "speaker": s["speaker"], "text": s["text"]}
-        for s in raw_segments
+        {
+            "start": s["start"], "end": s["end"],
+            "speaker": "TA" if _normalize_speaker_label(s["speaker"]) == ta_label else "Student",
+            "text": s["text"],
+        }
+        for s in segments
     ]
     participation = compute_participation(labeled)
     dead_air = compute_dead_air(labeled, duration)
     transcript_text = build_transcript_text(labeled)
 
-    transcription_confidence = data.pop("transcription_confidence_pct")
     screen_share = data.pop("screen_share")
     if not analyze_screen:
         screen_share = None

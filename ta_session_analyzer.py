@@ -11,8 +11,9 @@ Flow per row in the day's CSV:
   1. Resolve the direct video URL from the portal link (recording_utils.py —
      same `?url=` unwrapping used for lecture recordings)
   2. Download the recording to a temp file
-  3. Extract audio -> transcribe with Groq Whisper -> label TA vs Student
-     turns with an LLM -> run the full quality analysis (ta_core.py)
+  3. Transcribe + diarize with Deepgram (generic speaker labels), sample a
+     few shared-screen frames, then let Gemini map speakers to TA/Student
+     and run the full quality analysis (ta_core.py)
   4. Optionally sample screen-share frames from the same recording to detect
      directly-shared final solutions on screen
   5. Compute the weighted 0-100 score and AI flags
@@ -32,18 +33,21 @@ CSV input format (ta_sessions_today.csv):
       is skipped and simply won't appear in the report.
 
 Requirements (on top of requirements.txt):
-    google-genai, pydantic, plus ffmpeg/ffprobe on PATH (duration + audio
-    quality heuristic — the transcript/diarization/analysis itself is done by
-    Gemini directly on the uploaded video, no local audio extraction needed).
+    google-genai, pydantic, requests, plus ffmpeg/ffprobe on PATH (duration,
+    audio quality heuristic, and screen-share frame sampling — Deepgram reads
+    the recording directly, no local audio extraction needed).
 
 Run manually:
-    GEMINI_API_KEY=your_key python ta_session_analyzer.py ta_sessions_today.csv
+    GEMINI_API_KEY=your_gemini_key DEEPGRAM_API_KEY=your_deepgram_key \\
+        python ta_session_analyzer.py ta_sessions_today.csv
 
-Free-tier note: this pipeline runs on the Gemini API (see ta_core.py for
-model/rate-limit notes). One combined multimodal call per session (plus an
-optional small chat-analysis call) stays comfortably within the free tier's
-request-per-day limit for a 20-30 session test batch. Sessions are processed
-one at a time with retries/backoff below to ride out transient rate limits.
+Provider note: transcription/diarization runs on Deepgram (see ta_core.py)
+so its free credits absorb the most expensive part of the pipeline, while
+Gemini is only spent on the analysis call (rubric scoring + a handful of
+screenshots) plus an optional small chat-analysis call — both comfortably
+within Gemini's free tier for a 20-30 session test batch. Sessions are
+processed one at a time with retries/backoff below to ride out transient
+rate limits.
 """
 
 import os
@@ -62,6 +66,7 @@ from ta_pdf_report import generate_ta_pdf
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # never hardcode this
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")  # never hardcode this
 OUTPUT_DIR = "ta_reports"
 MAX_RETRIES = 3
 
@@ -70,8 +75,9 @@ MAX_RETRIES = 3
 # Process one session end-to-end
 # ---------------------------------------------------------------------------
 
-def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
+def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_key: str = None) -> dict:
     api_key = api_key or GEMINI_API_KEY
+    deepgram_api_key = deepgram_api_key or DEEPGRAM_API_KEY
     session_id = row["session_id"]
     ta_name = row.get("ta_name", "")
     student_name = row.get("student_name", "")
@@ -101,7 +107,7 @@ def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
             try:
                 print(f"[{session_id}] analyzing (attempt {attempt})...")
                 report = analyze_ta_session(
-                    api_key, tmp_video,
+                    api_key, tmp_video, deepgram_api_key,
                     analyze_screen=analyze_screen, chat_text=chat_text,
                 )
                 break
@@ -162,6 +168,8 @@ def process_session(row: dict, run_date: str, api_key: str = None) -> dict:
 def run_daily_batch(csv_path: str):
     if not GEMINI_API_KEY:
         raise EnvironmentError("Set GEMINI_API_KEY as an environment variable before running.")
+    if not DEEPGRAM_API_KEY:
+        raise EnvironmentError("Set DEEPGRAM_API_KEY as an environment variable before running.")
 
     run_date = datetime.now().strftime("%Y-%m-%d")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -216,7 +224,7 @@ if __name__ == "__main__":
 #
 # Linux/Mac (cron) — runs every day at 8 PM:
 #   crontab -e
-#   0 20 * * * cd "/path/to/Lecture analyzer" && GEMINI_API_KEY=xxx /usr/bin/python3 ta_session_analyzer.py ta_sessions_today.csv >> logs/ta_run.log 2>&1
+#   0 20 * * * cd "/path/to/Lecture analyzer" && GEMINI_API_KEY=xxx DEEPGRAM_API_KEY=yyy /usr/bin/python3 ta_session_analyzer.py ta_sessions_today.csv >> logs/ta_run.log 2>&1
 #
 # Windows (Task Scheduler):
 #   1. Task Scheduler > Create Basic Task > Daily, pick a time
@@ -224,8 +232,8 @@ if __name__ == "__main__":
 #      Program: python.exe
 #      Arguments: ta_session_analyzer.py ta_sessions_today.csv
 #      Start in: the lecture-analyzer folder
-#   3. Set GEMINI_API_KEY as a permanent environment variable so the scheduled
-#      task can see it.
+#   3. Set GEMINI_API_KEY and DEEPGRAM_API_KEY as permanent environment
+#      variables so the scheduled task can see them.
 #
 # Either way, ta_sessions_today.csv needs to be updated with that day's TA
 # session recording links before the scheduled time runs.
