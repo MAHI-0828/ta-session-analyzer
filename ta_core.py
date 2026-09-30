@@ -76,8 +76,12 @@ SESSION_STAGES = [
 # both are free-tier eligible as of mid-2026.
 GEMINI_MODEL = "gemini-3.5-flash"
 
-DEEPGRAM_MODEL = "nova-2"
+DEEPGRAM_MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-2")
 DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
+# Unset = Deepgram's default (English). Sessions are mostly Hinglish, so
+# it's worth trying e.g. DEEPGRAM_LANGUAGE=hi on a few recordings — check
+# Deepgram's docs for which model/language combos support code-switching.
+DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "").strip()
 
 # How many evenly-spaced screenshots to pull from the shared screen for
 # Gemini to look at — enough to catch a solution left on screen without
@@ -232,6 +236,7 @@ def transcribe_with_deepgram(api_key: str, audio_path: str) -> dict:
                 "punctuate": "true",
                 "smart_format": "true",
                 "utterances": "true",
+                **({"language": DEEPGRAM_LANGUAGE} if DEEPGRAM_LANGUAGE else {}),
             },
             headers={
                 "Authorization": f"Token {api_key}",

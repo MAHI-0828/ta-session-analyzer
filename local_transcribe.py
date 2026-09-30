@@ -23,19 +23,34 @@ Config (env vars, all optional):
                       in 8GB RAM); faster-whisper -> "small".
                       On a Mac that runs out of memory, try
                       "mlx-community/whisper-small-mlx".
-    WHISPER_LANGUAGE  "en" (default — keeps Hinglish in Latin script, same
-                      as the Deepgram path), "hi", or "auto" to detect.
+    WHISPER_LANGUAGE  "hi" (default), "en", or "auto" to detect. Sessions are
+                      mostly Hinglish, and forcing "en" makes Whisper
+                      TRANSLATE the Hindi parts into English instead of
+                      transcribing them. "hi" keeps what was actually said;
+                      the Romanized-Hinglish INITIAL_PROMPT below steers it
+                      toward Latin script (Whisper imitates the prompt's
+                      style), though some lines may still come out in
+                      Devanagari — Gemini reads both fine.
+
+Compare settings on one real recording before a big batch:
+    python local_transcribe.py some_session.mp4 --language hi en auto
+Transcripts are cached per session, so after changing WHISPER_LANGUAGE,
+re-run a batch with --force to re-transcribe sessions done earlier.
 """
 
 import importlib.util
 import math
 import os
 
-# Nudges Whisper toward Latin-script Hinglish + programming vocabulary
-# instead of translating or switching scripts mid-session.
+# Whisper continues in the style of its prompt, so this is written the way
+# the sessions sound: Romanized Hinglish with English tech terms. That nudges
+# it toward Latin-script Hinglish instead of Devanagari or an English
+# translation, and primes programming vocabulary (GROUP BY, array, loop...).
 INITIAL_PROMPT = (
-    "A Hinglish (Hindi + English) doubt-clearing session between a teaching "
-    "assistant and a student about programming, SQL, and data structures."
+    "Haan, toh aapka doubt kya hai? Sir, mera SQL query mein GROUP BY ka error "
+    "aa raha hai. Achha, ek baar apna code screen pe share karo. Dekho, yeh "
+    "column aggregate nahi hua hai, isliye error aa raha hai. Array, loop, "
+    "function, recursion, JOIN, WHERE clause. Okay sir, samajh aa gaya, thank you."
 )
 
 MLX_DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -52,7 +67,7 @@ def available_backend():
 
 
 def _language():
-    lang = os.environ.get("WHISPER_LANGUAGE", "en").strip().lower()
+    lang = os.environ.get("WHISPER_LANGUAGE", "hi").strip().lower()
     return None if lang in ("", "auto") else lang
 
 
@@ -128,3 +143,33 @@ def transcribe_locally(audio_path: str) -> dict:
     avg_confidence = sum(s["confidence"] for s in segments) / len(segments)
     return {"segments": segments, "confidence_pct": round(avg_confidence * 100, 1),
             "backend": backend}
+
+
+if __name__ == "__main__":
+    # A/B helper: transcribe one recording with each language setting and
+    # print the start of each transcript, to pick WHISPER_LANGUAGE by eye.
+    import argparse
+    import tempfile
+    import time
+
+    from ta_core import extract_audio, fmt_ts
+
+    parser = argparse.ArgumentParser(description="Compare local Whisper language settings on one recording.")
+    parser.add_argument("recording", help="video or audio file")
+    parser.add_argument("--language", nargs="+", default=["hi", "en", "auto"],
+                        help="settings to try (default: hi en auto)")
+    parser.add_argument("--lines", type=int, default=25, help="transcript lines to print per setting")
+    args = parser.parse_args()
+
+    print(f"backend: {available_backend()}  model: "
+          f"{os.environ.get('WHISPER_MODEL', MLX_DEFAULT_MODEL if available_backend() == 'mlx-whisper' else FASTER_WHISPER_DEFAULT_MODEL)}")
+    with tempfile.TemporaryDirectory() as tmp:
+        audio = extract_audio(args.recording, os.path.join(tmp, "audio.ogg"))
+        for lang in args.language:
+            os.environ["WHISPER_LANGUAGE"] = lang
+            started = time.time()
+            result = transcribe_locally(audio)
+            print(f"\n===== WHISPER_LANGUAGE={lang}  ({time.time() - started:.0f}s, "
+                  f"confidence {result['confidence_pct']}%) =====")
+            for seg in result["segments"][:args.lines]:
+                print(f"[{fmt_ts(seg['start'])}] {seg['text']}")
