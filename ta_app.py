@@ -1,13 +1,19 @@
 """
 Streamlit UI for the TA Session Analyzer — internal team tool.
 
+Transcript-only is the default everywhere: a run transcribes the recording
+and saves the transcript, with no Gemini call. Tick "Also run AI quality
+analysis" to score the session against the rubric as well — that reuses a
+saved transcript, so transcribing first and analyzing later never pays for
+transcription twice.
+
 Three tabs:
-  - Single Session: paste a recording URL or upload a video, run one
-    analysis, view the scorecard, download the PDF/JSON.
+  - Single Session: paste a recording URL or upload a video, get the
+    transcript (and optionally the scorecard), download TXT/JSON/PDF.
   - Batch (CSV): upload a CSV in the same format ta_session_analyzer.py's
     daily batch runner expects, run the whole day's sessions, watch
-    progress, download the rollup + PDFs.
-  - Saved results: every session ever analyzed on this machine, plus
+    progress, download all transcripts / the rollup / PDFs.
+  - Saved results: every session ever processed on this machine, plus
     backup/restore of the whole results store.
 
 Everything is saved to disk as it finishes (ta_reports/sessions/, see
@@ -17,9 +23,9 @@ with no API calls, and a half-done one resumes from its last stage.
 
 Secrets (Streamlit Cloud: app settings -> Secrets. Locally: create
 .streamlit/secrets.toml — it's gitignored, never commit it):
-    GEMINI_API_KEY   = "..."   # shared team key, used if no key is entered
     DEEPGRAM_API_KEY = "..."   # transcription/diarization — console.deepgram.com
                                # (not needed if you pick local Whisper)
+    GEMINI_API_KEY   = "..."   # only needed for the optional AI analysis
     APP_PASSWORD     = "..."   # optional — gates the whole app if set
 
 Run locally:
@@ -39,7 +45,7 @@ import streamlit as st
 import session_store
 from local_transcribe import available_backend
 from ta_pdf_report import generate_ta_pdf
-from ta_session_analyzer import process_session, row_key, summary_row
+from ta_session_analyzer import is_done, process_session, result_mode, row_key, summary_row
 
 st.set_page_config(page_title="TA Session Analyzer", page_icon="📋", layout="wide")
 
@@ -77,17 +83,11 @@ DEEPGRAM_API_KEY = _get_secret("DEEPGRAM_API_KEY")
 LOCAL_BACKEND = available_backend()
 
 st.title("📋 TA Session Analyzer")
-st.caption("Internal tool — scores TA doubt-clearing session recordings against the quality rubric.")
+st.caption("Internal tool — transcribes TA doubt-clearing session recordings, "
+           "and optionally scores them against the quality rubric.")
 
 with st.sidebar:
     st.subheader("Settings")
-    if GEMINI_API_KEY:
-        st.success("Gemini API key loaded from server config.")
-    else:
-        GEMINI_API_KEY = st.text_input("Gemini API key", type="password",
-                                        help="Free key: aistudio.google.com")
-        st.caption("Key is used for this session only — never stored or logged.")
-
     transcriber_options = ["deepgram"] + (["local"] if LOCAL_BACKEND else [])
     TRANSCRIBER = st.radio(
         "Transcription",
@@ -108,13 +108,31 @@ with st.sidebar:
                                               help="Free key: console.deepgram.com — used for transcription/diarization.")
             st.caption("Key is used for this session only — never stored or logged.")
 
+    if GEMINI_API_KEY:
+        st.success("Gemini API key loaded from server config.")
+    else:
+        GEMINI_API_KEY = st.text_input("Gemini API key (only for AI analysis)", type="password",
+                                        help="Free key: aistudio.google.com — not needed for transcripts.")
+        st.caption("Key is used for this session only — never stored or logged.")
+
     saved_count = len(session_store.list_results())
     st.divider()
     st.metric("Sessions saved on disk", saved_count)
     st.caption("Results survive page refreshes. On Streamlit Cloud, download a backup "
                "from the **Saved results** tab — its disk resets when the app restarts.")
 
-KEYS_READY = bool(GEMINI_API_KEY and (TRANSCRIBER == "local" or DEEPGRAM_API_KEY))
+TRANSCRIBE_READY = TRANSCRIBER == "local" or bool(DEEPGRAM_API_KEY)
+
+
+def _keys_ready(analyze: bool) -> bool:
+    return TRANSCRIBE_READY and (bool(GEMINI_API_KEY) or not analyze)
+
+
+def _missing_key_hint(analyze: bool):
+    if not TRANSCRIBE_READY:
+        st.caption("Enter a Deepgram API key in the sidebar, or install local Whisper.")
+    elif analyze and not GEMINI_API_KEY:
+        st.caption("AI analysis needs a Gemini API key (sidebar) — or untick it to just get the transcript.")
 
 
 def _run_session(row: dict, log=lambda m: None, **kwargs) -> dict:
@@ -123,7 +141,39 @@ def _run_session(row: dict, log=lambda m: None, **kwargs) -> dict:
                            transcriber=TRANSCRIBER, log=log, **kwargs)
 
 
+def _render_downloads(meta: dict, report: dict, key_prefix: str):
+    json_bytes = json.dumps({"session_meta": meta, "report": report},
+                             indent=2, ensure_ascii=False).encode("utf-8")
+    cols = st.columns(3)
+    cols[0].download_button("Download transcript (.txt)", report["transcript_text"].encode("utf-8"),
+                            key=f"{key_prefix}txt", file_name=f"{meta['session_id']}_transcript.txt",
+                            mime="text/plain", type="primary")
+    cols[1].download_button("Download JSON", json_bytes, key=f"{key_prefix}json",
+                            file_name=f"{meta['session_id']}.json", mime="application/json")
+    if report.get("mode", "analysis") == "analysis":
+        cols[2].download_button("Download PDF report", generate_ta_pdf(meta, report), key=f"{key_prefix}pdf",
+                                file_name=f"{meta['session_id']}.pdf", mime="application/pdf")
+
+
+def _render_transcript_only(meta: dict, report: dict, key_prefix: str):
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Duration", f"{report['duration_minutes']} min")
+    c2.metric("Transcribed with", report.get("transcriber", "deepgram"))
+    c3.metric("Confidence", f"{report.get('transcription_confidence_pct', '?')}%")
+    st.markdown("**Transcript**")
+    st.text_area("Transcript", report["transcript_text"], height=420,
+                 # session id in the key so switching sessions shows the new text
+                 key=f"{key_prefix}transcript_view_{meta['session_id']}", label_visibility="collapsed")
+    _render_downloads(meta, report, key_prefix)
+    st.caption("Want a scorecard? Run this session again with **Also run AI quality analysis** "
+               "ticked — it reuses this transcript, so only the Gemini call is made.")
+
+
 def _render_report(meta: dict, report: dict, key_prefix: str = ""):
+    if report.get("mode", "analysis") == "transcript":
+        _render_transcript_only(meta, report, key_prefix)
+        return
+
     breakdown = report["score_breakdown"]
     analysis = report["analysis"]
 
@@ -165,17 +215,7 @@ def _render_report(meta: dict, report: dict, key_prefix: str = ""):
     with st.expander("Full transcript"):
         st.text(report["transcript_text"])
 
-    pdf_bytes = generate_ta_pdf(meta, report)
-    json_bytes = json.dumps({"session_meta": meta, "report": report},
-                             indent=2, ensure_ascii=False).encode("utf-8")
-    dcol1, dcol2, dcol3 = st.columns(3)
-    dcol1.download_button("Download PDF report", pdf_bytes, key=f"{key_prefix}pdf",
-                           file_name=f"{meta['session_id']}.pdf", mime="application/pdf")
-    dcol2.download_button("Download JSON", json_bytes, key=f"{key_prefix}json",
-                           file_name=f"{meta['session_id']}.json", mime="application/json")
-    dcol3.download_button("Download transcript (.txt)", report["transcript_text"].encode("utf-8"),
-                           key=f"{key_prefix}txt", file_name=f"{meta['session_id']}_transcript.txt",
-                           mime="text/plain")
+    _render_downloads(meta, report, key_prefix)
 
 
 def _zip_pdfs(summaries: list) -> bytes:
@@ -187,11 +227,45 @@ def _zip_pdfs(summaries: list) -> bytes:
     return buf.getvalue()
 
 
-def _summary_df(summaries: list) -> pd.DataFrame:
-    df = pd.DataFrame(summaries).drop(columns=["pdf_path"], errors="ignore")
+def _zip_transcripts(results: list) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in results:
+            meta = r["session_meta"]
+            name = f"{meta.get('ta_name', '')}_{meta['session_id']}".strip("_").replace(" ", "-")
+            zf.writestr(f"{name}_transcript.txt", r["report"]["transcript_text"])
+    return buf.getvalue()
+
+
+def _summary_df(summaries: list, with_transcript: bool = False) -> pd.DataFrame:
+    """Table of sessions. The full transcript column is kept only for the
+    CSV download (with_transcript) — it's too long for the on-page table."""
+    drop = ["pdf_path", "transcript_path"] + ([] if with_transcript else ["transcript"])
+    df = pd.DataFrame(summaries).drop(columns=drop, errors="ignore")
     if "flags" in df:
-        df["flags"] = df["flags"].apply(lambda f: "; ".join(f) if f else "none")
+        df["flags"] = [("; ".join(f) or "none") if mode == "analysis" else ""
+                       for f, mode in zip(df["flags"], df["mode"])]
+    if (df.get("mode") == "transcript").all():
+        # Transcript-only table: drop the empty score columns.
+        df = df.drop(columns=["overall_score", "doubt_resolution", "ta_speaking_pct",
+                              "student_speaking_pct", "flags"], errors="ignore")
     return df
+
+
+def _batch_downloads(results: list, key_prefix: str):
+    summaries = [summary_row(r) for r in results]
+    cols = st.columns(3)
+    cols[0].download_button(f"Download all transcripts ({len(results)}, zip)", _zip_transcripts(results),
+                            file_name=f"ta_transcripts_{datetime.now().strftime('%Y%m%d')}.zip",
+                            mime="application/zip", type="primary", key=f"{key_prefix}txts")
+    # utf-8-sig (BOM) so Excel shows Hinglish/Devanagari text correctly.
+    rollup_csv = _summary_df(summaries, with_transcript=True).to_csv(index=False).encode("utf-8-sig")
+    cols[1].download_button("Download results CSV (with transcripts)", rollup_csv,
+                            file_name=f"ta_rollup_{datetime.now().strftime('%Y%m%d')}.csv",
+                            key=f"{key_prefix}csv")
+    if any(s.get("pdf_path") for s in summaries):
+        cols[2].download_button("Download all PDFs (zip)", _zip_pdfs(summaries),
+                                file_name="ta_reports.zip", mime="application/zip", key=f"{key_prefix}pdfs")
 
 
 tab_single, tab_batch, tab_saved = st.tabs(["Single Session", "Batch (CSV)", "Saved results"])
@@ -199,7 +273,7 @@ tab_single, tab_batch, tab_saved = st.tabs(["Single Session", "Batch (CSV)", "Sa
 # ─── Single Session ───────────────────────────────────────────────────────────
 
 with tab_single:
-    st.subheader("Analyze one session")
+    st.subheader("Transcribe one session")
     input_mode = st.radio("Input", ["Recording URL", "Upload video file"], horizontal=True)
 
     url_value, uploaded_video = "", None
@@ -214,11 +288,17 @@ with tab_single:
         session_id = st.text_input("Session ID", value=f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     with col2:
         student_name = st.text_input("Student name", value="")
+
+    single_analyze = st.checkbox("Also run AI quality analysis (Gemini)", value=False, key="single_analyze",
+                                 help="Off = transcript only (no Gemini call). On = transcript + rubric "
+                                      "scorecard + PDF.")
+    analyze_screen, chat_file = False, None
+    if single_analyze:
         analyze_screen = st.checkbox("Analyze shared screen", value=True)
+        chat_file = st.file_uploader("Optional: chat log (.txt)", type=["txt"], key="single_chat")
 
-    chat_file = st.file_uploader("Optional: chat log (.txt)", type=["txt"], key="single_chat")
-
-    if st.button("Analyze session", type="primary", disabled=not KEYS_READY):
+    run_label = "Transcribe + analyze" if single_analyze else "Get transcript"
+    if st.button(run_label, type="primary", disabled=not _keys_ready(single_analyze)):
         if not session_id:
             st.error("Session ID is required.")
         elif input_mode == "Recording URL" and not url_value:
@@ -229,7 +309,7 @@ with tab_single:
             row = {"recording_url": url_value, "ta_name": ta_name, "student_name": student_name,
                    "session_id": session_id, "analyze_screen": "yes" if analyze_screen else "no"}
             try:
-                with st.status("Analyzing — this can take a few minutes...", expanded=True) as status:
+                with st.status("Working — this can take a few minutes...", expanded=True) as status:
                     with tempfile.TemporaryDirectory() as tmp:
                         local_video = None
                         if uploaded_video:
@@ -240,12 +320,14 @@ with tab_single:
                             row["chat_log_path"] = os.path.join(tmp, "chat.txt")
                             with open(row["chat_log_path"], "wb") as f:
                                 f.write(chat_file.getbuffer())
-                        _run_session(row, log=status.write, local_video_path=local_video)
+                        _run_session(row, log=status.write, local_video_path=local_video,
+                                     analyze=single_analyze)
                     status.update(label="Done — saved to disk.", state="complete")
                 st.session_state["last_key"] = row_key(row)
             except Exception as e:
-                st.error(f"Analysis failed: {e}. Anything already finished (e.g. the transcript) "
-                         "was saved — press Analyze again with the same Session ID to resume.")
+                st.error(f"Failed: {e}. Anything already finished (e.g. the transcript) "
+                         f"was saved — press **{run_label}** again with the same Session ID to resume.")
+    _missing_key_hint(single_analyze)
 
     last = session_store.load_result(st.session_state["last_key"]) if "last_key" in st.session_state else None
     if last:
@@ -256,26 +338,39 @@ with tab_single:
 
 with tab_batch:
     st.subheader("Batch run from CSV")
-    st.caption("Columns: recording_url, ta_name, student_name, session_id, analyze_screen (yes/no), chat_log_path (leave blank)")
+    st.caption("Columns: recording_url, ta_name, student_name, session_id, analyze_screen (yes/no), "
+               "chat_log_path (leave blank). Only recording_url and session_id matter for transcripts.")
     csv_file = st.file_uploader("Upload sessions CSV", type=["csv"], key="batch_csv")
 
     if csv_file:
         rows = pd.read_csv(io.BytesIO(csv_file.getvalue()), dtype=str).fillna("").to_dict("records")
-        statuses = [session_store.stage_status(row_key(r)) for r in rows]
-        n_done = statuses.count("done")
-        n_half = statuses.count("transcribed")
-        st.info(f"**{len(rows)} sessions in CSV** — {n_done} already analyzed (will be skipped, no API calls), "
-                f"{n_half} transcribed but not scored (will resume), "
-                f"{len(rows) - n_done - n_half} new.")
+
+        batch_analyze = st.checkbox("Also run AI quality analysis (Gemini)", value=False, key="batch_analyze",
+                                    help="Off = transcripts only (no Gemini calls). On = transcript + rubric "
+                                         "scorecard + PDF per session; already-saved transcripts are reused.")
+
+        saved_results = {row_key(r): session_store.load_result(row_key(r)) for r in rows}
+        n_done = sum(is_done(saved_results[row_key(r)], batch_analyze) for r in rows)
+        n_reuse = sum(not is_done(saved_results[row_key(r)], batch_analyze)
+                      and session_store.has_transcript(row_key(r)) for r in rows)
+        done_word = "analyzed" if batch_analyze else "transcribed"
+        st.info(f"**{len(rows)} sessions in CSV** — {n_done} already {done_word} (skipped, no API calls), "
+                + (f"{n_reuse} transcribed but not analyzed (transcript reused, only Gemini runs), "
+                   if batch_analyze else
+                   f"{n_reuse} partly done (will resume), ")
+                + f"{len(rows) - n_done - n_reuse} new.")
 
         opt1, opt2 = st.columns(2)
-        reanalyze = opt1.checkbox("Re-score finished sessions with Gemini",
-                                  help="Reuses saved transcripts + screenshots — only the Gemini call "
-                                       "is repeated. Use after changing the prompt/rubric.")
+        reanalyze = False
+        if batch_analyze:
+            reanalyze = opt1.checkbox("Re-score finished sessions with Gemini",
+                                      help="Reuses saved transcripts + screenshots — only the Gemini call "
+                                           "is repeated. Use after changing the prompt/rubric.")
         force = opt2.checkbox("Redo everything from scratch",
                               help="Ignores all saved work, including transcripts. Costs API calls again.")
 
-        if st.button("Run batch", type="primary", disabled=not KEYS_READY):
+        batch_label = "Run batch: transcripts + analysis" if batch_analyze else "Run batch: transcripts"
+        if st.button(batch_label, type="primary", disabled=not _keys_ready(batch_analyze)):
             progress = st.progress(0.0)
             status = st.empty()
             log_box = st.empty()
@@ -290,7 +385,8 @@ with tab_batch:
                 sid = row.get("session_id") or row_key(row)
                 status.write(f"Processing `{sid}` ({i + 1}/{len(rows)})...")
                 try:
-                    results.append(_run_session(row, log=log, force=force, force_reanalysis=reanalyze))
+                    results.append(_run_session(row, log=log, force=force, force_reanalysis=reanalyze,
+                                                analyze=batch_analyze))
                 except Exception as e:
                     errors.append({"session_id": sid, "error": f"{type(e).__name__}: {e}"})
                     log(f"[{sid}] FAILED — {e}")
@@ -300,23 +396,20 @@ with tab_batch:
             status.write("Done.")
             st.session_state["batch_errors"] = errors
             st.rerun()
+        _missing_key_hint(batch_analyze)
 
         # Always rebuilt from disk, so the table survives refreshes and
         # shows everything finished so far — even from an interrupted run.
-        finished = [summary_row(session_store.load_result(row_key(r)))
-                    for r in rows if session_store.load_result(row_key(r))]
+        finished = [res for res in (session_store.load_result(row_key(r)) for r in rows) if res]
         errors = st.session_state.get("batch_errors", [])
         if finished:
-            st.success(f"{len(finished)}/{len(rows)} sessions from this CSV analyzed and saved.")
-            display_df = _summary_df(finished)
-            st.dataframe(display_df, use_container_width=True)
-            d1, d2 = st.columns(2)
-            d1.download_button("Download rollup CSV", display_df.to_csv(index=False).encode("utf-8"),
-                               file_name=f"ta_rollup_{datetime.now().strftime('%Y%m%d')}.csv")
-            d2.download_button("Download all PDFs (zip)", _zip_pdfs(finished),
-                               file_name="ta_reports.zip", mime="application/zip")
+            n_analyzed = sum(result_mode(r) == "analysis" for r in finished)
+            st.success(f"{len(finished)}/{len(rows)} sessions from this CSV have a saved transcript"
+                       + (f" ({n_analyzed} also analyzed)." if n_analyzed else "."))
+            st.dataframe(_summary_df([summary_row(r) for r in finished]), use_container_width=True)
+            _batch_downloads(finished, key_prefix="batch_")
         if errors:
-            st.error(f"{len(errors)} failed in the last run — press **Run batch** again to retry just those.")
+            st.error(f"{len(errors)} failed in the last run — press the run button again to retry just those.")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
 
 # ─── Saved results ─────────────────────────────────────────────────────────────
@@ -344,15 +437,18 @@ with tab_saved:
                 st.error(f"Restore failed: {e}")
 
     if not saved:
-        st.info("Nothing analyzed yet.")
+        st.info("Nothing saved yet.")
     else:
-        summaries = [summary_row(r) for r in saved]
-        st.dataframe(_summary_df(summaries), use_container_width=True)
-        st.download_button("Download all PDFs (zip)", _zip_pdfs(summaries),
-                           file_name="ta_reports_all.zip", mime="application/zip", key="saved_pdfs")
+        st.dataframe(_summary_df([summary_row(r) for r in saved]), use_container_width=True)
+        _batch_downloads(saved, key_prefix="saved_")
 
-        labels = {r["_key"]: f"{r['session_meta']['session_id']} — {r['session_meta'].get('ta_name', '')} "
-                             f"({r['report']['score_breakdown']['overall']:.0f}/100)" for r in saved}
+        def _label(r):
+            meta = r["session_meta"]
+            tag = (f"{r['report']['score_breakdown']['overall']:.0f}/100"
+                   if result_mode(r) == "analysis" else "transcript")
+            return f"{meta['session_id']} — {meta.get('ta_name', '')} ({tag})"
+
+        labels = {r["_key"]: _label(r) for r in saved}
         pick = st.selectbox("View a session", list(labels), format_func=labels.get)
         chosen = next(r for r in saved if r["_key"] == pick)
         _render_report(chosen["session_meta"], chosen["report"], key_prefix="saved_")

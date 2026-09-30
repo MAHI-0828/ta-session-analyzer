@@ -1,13 +1,15 @@
 """
 TA Session Analyzer — daily batch runner
 -----------------------------------------
-Scores TA doubt-clearing session recordings against the quality rubric in the
-TA Session Analyzer PRD (doubt resolution, teaching quality, direct-solution
+Transcribes TA doubt-clearing session recordings (the default), and — with
+--analyze — also scores them against the quality rubric in the TA Session
+Analyzer PRD (doubt resolution, teaching quality, direct-solution
 detection, participation, communication, professionalism, technical accuracy,
-session flow, dead air) and produces a per-session PDF/CSV/JSON report plus a
+session flow, dead air), producing a per-session PDF/CSV/JSON report plus a
 daily rollup — the same pattern as auto_lecture_analyzer.py.
 
-Flow per row in the day's CSV:
+Transcript-only runs do steps 1-3 below minus the Gemini part (and skip
+screenshots), then save transcript.txt. Full flow per row with --analyze:
   1. Resolve the direct video URL from the portal link (recording_utils.py —
      same `?url=` unwrapping used for lecture recordings)
   2. Download the recording to a temp file
@@ -43,15 +45,21 @@ Requirements (on top of requirements.txt):
     audio quality heuristic, and screen-share frame sampling — Deepgram reads
     the recording directly, no local audio extraction needed).
 
-Run manually:
-    GEMINI_API_KEY=your_gemini_key DEEPGRAM_API_KEY=your_deepgram_key \\
+Run manually — TRANSCRIPT ONLY is the default (no Gemini call, no Gemini
+key needed); each session's transcript lands in
+ta_reports/sessions/<session_id>/transcript.txt:
+    DEEPGRAM_API_KEY=your_deepgram_key \\
         python ta_session_analyzer.py ta_sessions_today.csv
 
-    # Free local transcription (no Deepgram key needed) — see local_transcribe.py
-    GEMINI_API_KEY=your_gemini_key \\
-        python ta_session_analyzer.py ta_sessions_today.csv --transcriber local
+    # Free local transcription (no API keys at all) — see local_transcribe.py
+    python ta_session_analyzer.py ta_sessions_today.csv --transcriber local
 
-    # Re-score already-transcribed sessions (e.g. after a prompt change) —
+    # Opt in to the full rubric analysis. Sessions already transcribed reuse
+    # their saved transcript — only the Gemini call is made.
+    GEMINI_API_KEY=your_gemini_key \\
+        python ta_session_analyzer.py ta_sessions_today.csv --transcriber local --analyze
+
+    # Re-score already-analyzed sessions (e.g. after a prompt change) —
     # reuses saved transcripts + screenshots, only Gemini is called again
     python ta_session_analyzer.py ta_sessions_today.csv --reanalyze
 
@@ -71,10 +79,11 @@ import os
 import time
 import traceback
 from datetime import datetime
+from typing import Optional
 
 import session_store
 from recording_utils import extract_video_url, download_video
-from ta_core import analyze_ta_session
+from ta_core import analyze_ta_session, transcribe_ta_session
 from ta_pdf_report import generate_ta_pdf
 
 # ---------------------------------------------------------------------------
@@ -95,22 +104,39 @@ def row_key(row: dict) -> str:
     return session_store.session_key(row.get("session_id", ""), row.get("recording_url", ""))
 
 
+def result_mode(result: dict) -> str:
+    """"transcript" or "analysis" (results saved before transcript-only mode
+    existed have no mode field and were always full analyses)."""
+    return result["report"].get("mode", "analysis")
+
+
+def is_done(result: Optional[dict], analyze: bool) -> bool:
+    """A saved full analysis satisfies either mode; a transcript-only result
+    satisfies only a transcript-only run (analyzing it reuses the transcript)."""
+    return bool(result) and (result_mode(result) == "analysis" or not analyze)
+
+
 def summary_row(result: dict) -> dict:
-    """Flatten a saved result.json into one rollup/table row."""
+    """Flatten a saved result.json into one rollup/table row. Score columns
+    are blank for transcript-only sessions."""
     meta, report = result["session_meta"], result["report"]
+    analyzed = result_mode(result) == "analysis"
     return {
         "session_id": meta["session_id"],
         "ta_name": meta.get("ta_name", ""),
         "student_name": meta.get("student_name", ""),
         "date": result.get("date", ""),
+        "mode": result_mode(result),
         "duration_minutes": report["duration_minutes"],
-        "overall_score": report["score_breakdown"]["overall"],
-        "doubt_resolution": report["analysis"]["doubt_resolution"]["status"],
-        "ta_speaking_pct": report["participation"]["ta_pct"],
-        "student_speaking_pct": report["participation"]["student_pct"],
+        "overall_score": report["score_breakdown"]["overall"] if analyzed else None,
+        "doubt_resolution": report["analysis"]["doubt_resolution"]["status"] if analyzed else None,
+        "ta_speaking_pct": report["participation"]["ta_pct"] if analyzed else None,
+        "student_speaking_pct": report["participation"]["student_pct"] if analyzed else None,
         "transcriber": report.get("transcriber", "deepgram"),
-        "flags": report["flags"],
+        "flags": report.get("flags", []),
         "pdf_path": result.get("pdf_path"),
+        "transcript_path": result.get("transcript_path"),
+        "transcript": report["transcript_text"],
     }
 
 
@@ -120,12 +146,19 @@ def summary_row(result: dict) -> dict:
 
 def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_key: str = None,
                     transcriber: str = "deepgram", force: bool = False,
-                    force_reanalysis: bool = False, log=print, local_video_path: str = None) -> dict:
-    """Analyze one CSV row, resuming from whatever is already saved for it.
-    Returns the rollup summary row. A session whose result.json exists is
-    returned straight from disk with no API calls, unless force (redo
-    everything) or force_reanalysis (reuse transcript, re-run Gemini).
-    local_video_path skips the download (e.g. a file uploaded in the UI)."""
+                    force_reanalysis: bool = False, log=print, local_video_path: str = None,
+                    analyze: bool = False) -> dict:
+    """Transcribe one CSV row — and, if analyze, score it with Gemini —
+    resuming from whatever is already saved for it. Returns the rollup
+    summary row.
+
+    Transcript-only is the default (no Gemini call, no Gemini key needed).
+    A session that's already done for the requested mode is returned
+    straight from disk with no API calls, unless force (redo everything) or
+    force_reanalysis (reuse transcript, re-run Gemini; implies analyze).
+    Analyzing a session that was earlier only transcribed reuses its saved
+    transcript. local_video_path skips the download (e.g. a UI upload)."""
+    analyze = analyze or force_reanalysis
     api_key = api_key or GEMINI_API_KEY
     deepgram_api_key = deepgram_api_key or DEEPGRAM_API_KEY
     key = row_key(row)
@@ -149,8 +182,9 @@ def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_
             os.remove(frames_marker)
 
     existing = session_store.load_result(key)
-    if existing and not force_reanalysis:
-        _log("already analyzed — loaded from disk (no API calls)")
+    if is_done(existing, analyze) and not force_reanalysis:
+        _log(f"already {'analyzed' if result_mode(existing) == 'analysis' else 'transcribed'}"
+             " — loaded from disk (no API calls)")
         return summary_row(existing)
 
     _log("starting...")
@@ -176,23 +210,30 @@ def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_
             os.replace(tmp_video + ".part", tmp_video)
         return tmp_video
 
+    def run_pipeline() -> dict:
+        if not analyze:
+            return transcribe_ta_session(fetch_video, deepgram_api_key, cache_dir=folder,
+                                         transcriber=transcriber, log=_log)
+        return analyze_ta_session(
+            api_key, fetch_video, deepgram_api_key,
+            analyze_screen=analyze_screen, chat_text=chat_text,
+            cache_dir=folder, transcriber=transcriber,
+            force_reanalysis=force_reanalysis, log=_log,
+        )
+
+    step = "analyzing" if analyze else "transcribing"
     try:
         report = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                _log(f"analyzing (attempt {attempt})...")
-                report = analyze_ta_session(
-                    api_key, fetch_video, deepgram_api_key,
-                    analyze_screen=analyze_screen, chat_text=chat_text,
-                    cache_dir=folder, transcriber=transcriber,
-                    force_reanalysis=force_reanalysis, log=_log,
-                )
+                _log(f"{step} (attempt {attempt})...")
+                report = run_pipeline()
                 break
             except Exception as e:
                 if attempt == MAX_RETRIES:
                     raise
                 wait = RETRY_BASE_WAIT_SECONDS * attempt
-                _log(f"analysis failed ({type(e).__name__}: {e}), retrying in {wait}s...")
+                _log(f"{step} failed ({type(e).__name__}: {e}), retrying in {wait}s...")
                 time.sleep(wait)
     finally:
         for leftover in (tmp_video, tmp_video + ".part"):
@@ -201,19 +242,28 @@ def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_
 
     session_meta = {"session_id": session_id, "ta_name": ta_name, "student_name": student_name}
 
-    pdf_path = os.path.join(folder, session_store.PDF_FILE)
-    try:
-        session_store.save_bytes(folder, session_store.PDF_FILE, generate_ta_pdf(session_meta, report))
-    except Exception as e:
-        _log(f"PDF generation failed: {e}")
-        pdf_path = None
+    transcript_path = session_store.save_bytes(folder, session_store.TRANSCRIPT_TXT_FILE,
+                                               report["transcript_text"].encode("utf-8"))
 
-    result = {"session_meta": session_meta, "date": run_date, "report": report, "pdf_path": pdf_path}
+    pdf_path = None
+    if analyze:
+        try:
+            pdf_path = session_store.save_bytes(folder, session_store.PDF_FILE,
+                                                generate_ta_pdf(session_meta, report))
+        except Exception as e:
+            _log(f"PDF generation failed: {e}")
+
+    result = {"session_meta": session_meta, "date": run_date, "report": report,
+              "pdf_path": pdf_path, "transcript_path": transcript_path}
     # result.json is written last — its existence is what marks the session done.
     session_store.save_json(folder, session_store.RESULT_FILE, result)
 
-    overall = report["score_breakdown"]["overall"]
-    _log(f"done — overall score {overall}/100, flags: {report['flags'] or 'none'}")
+    if analyze:
+        overall = report["score_breakdown"]["overall"]
+        _log(f"done — overall score {overall}/100, flags: {report['flags'] or 'none'}")
+    else:
+        _log(f"done — transcript saved ({len(report['transcript_segments'])} lines, "
+             f"{report['duration_minutes']} min)")
     return summary_row(result)
 
 
@@ -228,26 +278,30 @@ def write_rollup(reports: list, errors: list, run_date: str) -> str:
         json.dump({"reports": reports, "errors": errors}, f, indent=2, ensure_ascii=False)
 
     out_csv = os.path.join(OUTPUT_DIR, f"report_{run_date}.csv")
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    # utf-8-sig (BOM) so Excel shows Hinglish/Devanagari text correctly.
+    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "session_id", "ta_name", "student_name", "duration_minutes",
+            "session_id", "ta_name", "student_name", "mode", "duration_minutes",
             "overall_score", "doubt_resolution", "ta_speaking_pct",
-            "student_speaking_pct", "transcriber", "flags",
+            "student_speaking_pct", "transcriber", "flags", "transcript_path", "transcript",
         ])
         for r in reports:
             writer.writerow([
-                r["session_id"], r["ta_name"], r["student_name"], r["duration_minutes"],
+                r["session_id"], r["ta_name"], r["student_name"], r["mode"], r["duration_minutes"],
                 r["overall_score"], r["doubt_resolution"], r["ta_speaking_pct"],
-                r["student_speaking_pct"], r["transcriber"], "; ".join(r["flags"]) or "none",
+                r["student_speaking_pct"], r["transcriber"],
+                ("; ".join(r["flags"]) or "none") if r["mode"] == "analysis" else "",
+                r["transcript_path"] or "", r["transcript"],
             ])
     return out_csv
 
 
 def run_daily_batch(csv_path: str, transcriber: str = "deepgram", force: bool = False,
-                    force_reanalysis: bool = False):
-    if not GEMINI_API_KEY:
-        raise EnvironmentError("Set GEMINI_API_KEY as an environment variable before running.")
+                    force_reanalysis: bool = False, analyze: bool = False):
+    analyze = analyze or force_reanalysis
+    if analyze and not GEMINI_API_KEY:
+        raise EnvironmentError("Set GEMINI_API_KEY as an environment variable before running with --analyze.")
     if transcriber == "deepgram" and not DEEPGRAM_API_KEY:
         raise EnvironmentError("Set DEEPGRAM_API_KEY, or pass --transcriber local for free local Whisper.")
 
@@ -264,7 +318,7 @@ def run_daily_batch(csv_path: str, transcriber: str = "deepgram", force: bool = 
         print(f"\n── {i}/{len(rows)} ──")
         try:
             reports.append(process_session(row, run_date, transcriber=transcriber, force=force,
-                                           force_reanalysis=force_reanalysis))
+                                           force_reanalysis=force_reanalysis, analyze=analyze))
         except Exception as e:
             err = f"{row.get('session_id', '?')}: {type(e).__name__}: {e}"
             print(f"  FAILED — {err}\n{traceback.format_exc()}")
@@ -273,25 +327,32 @@ def run_daily_batch(csv_path: str, transcriber: str = "deepgram", force: bool = 
         # even if the run is killed partway through.
         write_rollup(reports, errors, run_date)
 
-    flagged = [r for r in reports if r["flags"]]
-    print(f"\nDone. {len(reports)} succeeded, {len(errors)} failed, {len(flagged)} flagged for manual review.")
+    if analyze:
+        flagged = [r for r in reports if r["flags"]]
+        print(f"\nDone. {len(reports)} succeeded, {len(errors)} failed, {len(flagged)} flagged for manual review.")
+    else:
+        print(f"\nDone. {len(reports)} transcribed, {len(errors)} failed. "
+              "Add --analyze to also score them (reuses these transcripts).")
     if errors:
         print("Re-run the same command to retry the failed ones — finished sessions are skipped.")
     print(f"Per-session results in {session_store.STORE_DIR}/, rollup in {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Score a CSV of TA session recordings (resumable).")
+    parser = argparse.ArgumentParser(
+        description="Transcribe a CSV of TA session recordings, optionally scoring them (resumable).")
     parser.add_argument("csv", nargs="?", default="ta_sessions_today.csv")
     parser.add_argument("--transcriber", choices=["deepgram", "local"], default="deepgram",
                         help="deepgram (API) or local (free Whisper on this machine)")
+    parser.add_argument("--analyze", action="store_true",
+                        help="also score each session with Gemini (default: transcript only)")
     parser.add_argument("--reanalyze", action="store_true",
-                        help="re-run Gemini scoring, reusing saved transcripts/screenshots")
+                        help="re-run Gemini scoring, reusing saved transcripts/screenshots (implies --analyze)")
     parser.add_argument("--force", action="store_true",
                         help="ignore everything saved and redo each session from scratch")
     args = parser.parse_args()
     run_daily_batch(args.csv, transcriber=args.transcriber, force=args.force,
-                    force_reanalysis=args.reanalyze)
+                    force_reanalysis=args.reanalyze, analyze=args.analyze)
 
 
 # ---------------------------------------------------------------------------
