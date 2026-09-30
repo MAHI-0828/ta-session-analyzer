@@ -1,0 +1,9 @@
+# Optional: free local transcription (local_transcribe.py) instead of Deepgram.
+# Install on the machine that runs the analyzer — NOT needed on Streamlit Cloud:
+#     pip install -r requirements.txt -r requirements-local.txt
+#
+# Apple Silicon Mac (M1/M2/M3): runs Whisper on the Mac's GPU via MLX.
+# First run downloads the model (~1.6GB for large-v3-turbo) and caches it.
+mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"
+# Everything else (Intel Mac, Linux, Windows): CPU Whisper.
+faster-whisper>=1.0.0; sys_platform != "darwin" or platform_machine != "arm64"
