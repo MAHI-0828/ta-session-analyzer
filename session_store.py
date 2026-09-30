@@ -8,10 +8,12 @@ output there the moment it finishes:
         media.json           duration + audio-volume heuristic
         frames/              sampled shared-screen screenshots (+ frames.json)
         transcript.json      Deepgram or local-Whisper transcript  <- the costly bit
-        analysis.json        raw Gemini rubric output (+ the inputs it used)
-        chat_analysis.json   optional chat-log analysis
+        transcript.txt       readable transcript (always written)
+        analysis.json        raw Gemini rubric output (+ the inputs it used) — analysis mode only
+        chat_analysis.json   optional chat-log analysis — analysis mode only
         result.json          final report + session meta  <- "this one is done"
-        report.pdf
+                             (report.mode is "transcript" or "analysis")
+        report.pdf           analysis mode only
 
 So if a batch dies after 15 sessions (a page refresh, a crash, a rate
 limit), re-running the same CSV skips those 15 entirely, and any session
@@ -36,6 +38,7 @@ from typing import List, Optional
 STORE_DIR = os.path.join("ta_reports", "sessions")
 RESULT_FILE = "result.json"
 PDF_FILE = "report.pdf"
+TRANSCRIPT_TXT_FILE = "transcript.txt"
 FRAMES_DIR = "frames"
 
 
@@ -115,14 +118,8 @@ def load_result(key: str, root: str = STORE_DIR) -> Optional[dict]:
     return load_json(folder, RESULT_FILE) if os.path.isdir(folder) else None
 
 
-def stage_status(key: str, root: str = STORE_DIR) -> str:
-    """Human-readable progress of a session: done / transcribed / pending."""
-    folder = os.path.join(root, key)
-    if load_json(folder, RESULT_FILE) is not None:
-        return "done"
-    if load_json(folder, "transcript.json") is not None:
-        return "transcribed"
-    return "pending"
+def has_transcript(key: str, root: str = STORE_DIR) -> bool:
+    return load_json(os.path.join(root, key), "transcript.json") is not None
 
 
 def list_results(root: str = STORE_DIR) -> List[dict]:

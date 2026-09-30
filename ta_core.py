@@ -22,6 +22,10 @@ Trade-off: TA/Student attribution now comes from conversational content
 alone (who explains vs. who asks) rather than voice + visual cues together,
 so it's worth spot-checking on calls with unusual dynamics.
 
+Transcript-only is the default: transcribe_ta_session() runs just the
+media probe + transcription (no Gemini, no screenshots). The full rubric
+analysis (analyze_ta_session) is opt-in, and reuses a saved transcript.
+
 Resumability: every stage (media probe, screenshots, transcript, Gemini
 analysis, final report) is saved to the session's cache_dir as soon as it
 finishes, and reused on the next run. A batch that dies halfway — a
@@ -561,6 +565,89 @@ def _sha(text: Optional[str]) -> Optional[str]:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12] if text else None
 
 
+def _lazy_video(video_source: VideoSource) -> Callable[[], str]:
+    """Resolve video_source (path or downloader) on first use only, so a
+    session whose stages are all cached never downloads the recording."""
+    resolved = {}
+
+    def video_path() -> str:
+        if "path" not in resolved:
+            resolved["path"] = video_source() if callable(video_source) else video_source
+        return resolved["path"]
+    return video_path
+
+
+def _load_or_probe_media(cache_dir: str, video_path: Callable[[], str], log) -> dict:
+    media = session_store.load_json(cache_dir, "media.json")
+    if media is None:
+        log("probing media...")
+        media = {"duration": get_duration_seconds(video_path()),
+                 "audio_quality": estimate_audio_quality(video_path())}
+        session_store.save_json(cache_dir, "media.json", media)
+    return media
+
+
+def _load_or_transcribe(cache_dir: str, video_path: Callable[[], str], tmp: str,
+                        transcriber: str, deepgram_api_key: str, log) -> dict:
+    """Any saved transcript is reused regardless of which backend made it."""
+    transcript = session_store.load_json(cache_dir, "transcript.json")
+    if transcript is None:
+        audio_path = extract_audio(video_path(), os.path.join(tmp, "audio.ogg"))
+        if transcriber == "local":
+            from local_transcribe import transcribe_locally
+            log("transcribing locally with Whisper (free)...")
+            transcript = transcribe_locally(audio_path)
+        else:
+            if not deepgram_api_key:
+                raise ValueError("Deepgram transcription needs a DEEPGRAM_API_KEY "
+                                 "(or use transcriber='local').")
+            log("transcribing with Deepgram...")
+            transcript = transcribe_with_deepgram(deepgram_api_key, audio_path)
+        session_store.save_json(cache_dir, "transcript.json", transcript)
+    return transcript
+
+
+def build_readable_transcript_text(segments: list) -> str:
+    """Transcript for people to read when no analysis was run, so TA/Student
+    roles are unknown: Deepgram's generic "Speaker 0/1" labels are kept,
+    and local Whisper lines (no speaker info) are just timestamped."""
+    return "\n".join(
+        f"[{fmt_ts(seg['start'])}] "
+        + (f"Speaker {seg['speaker']}: " if seg.get("speaker") is not None else "")
+        + seg["text"]
+        for seg in segments
+    )
+
+
+def transcribe_ta_session(video_source: VideoSource, deepgram_api_key: str = "",
+                          cache_dir: Optional[str] = None, transcriber: str = "deepgram",
+                          log: Callable[[str], None] = print) -> dict:
+    """Transcript-only run (the default): media probe + transcription, no
+    Gemini call and no screenshots. Uses the same cache as
+    analyze_ta_session, so analyzing the session later reuses this
+    transcript instead of paying for it again."""
+    if transcriber not in TRANSCRIBERS:
+        raise ValueError(f"transcriber must be one of {TRANSCRIBERS}, got {transcriber!r}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_dir = cache_dir or os.path.join(tmp, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        video_path = _lazy_video(video_source)
+        media = _load_or_probe_media(cache_dir, video_path, log)
+        transcript = _load_or_transcribe(cache_dir, video_path, tmp, transcriber, deepgram_api_key, log)
+
+    segments = transcript["segments"]
+    return {
+        "mode": "transcript",
+        "duration_minutes": round(media["duration"] / 60, 1),
+        "audio_quality": media["audio_quality"],
+        "transcription_confidence_pct": transcript["confidence_pct"],
+        "transcriber": transcript.get("backend", "deepgram"),
+        "transcript_text": build_readable_transcript_text(segments),
+        "transcript_segments": segments,
+    }
+
+
 def analyze_ta_session(gemini_api_key: str, video_source: VideoSource, deepgram_api_key: str = "",
                         analyze_screen: bool = True, chat_text: str = None,
                         cache_dir: Optional[str] = None, transcriber: str = "deepgram",
@@ -583,20 +670,10 @@ def analyze_ta_session(gemini_api_key: str, video_source: VideoSource, deepgram_
     with tempfile.TemporaryDirectory() as tmp:
         cache_dir = cache_dir or os.path.join(tmp, "cache")
         os.makedirs(cache_dir, exist_ok=True)
-        resolved_video = {}
-
-        def video_path() -> str:
-            if "path" not in resolved_video:
-                resolved_video["path"] = video_source() if callable(video_source) else video_source
-            return resolved_video["path"]
+        video_path = _lazy_video(video_source)
 
         # Stage 1: duration + audio-volume heuristic (local, ffmpeg)
-        media = session_store.load_json(cache_dir, "media.json")
-        if media is None:
-            log("probing media...")
-            media = {"duration": get_duration_seconds(video_path()),
-                     "audio_quality": estimate_audio_quality(video_path())}
-            session_store.save_json(cache_dir, "media.json", media)
+        media = _load_or_probe_media(cache_dir, video_path, log)
         duration = media["duration"]
         audio_quality = media["audio_quality"]
 
@@ -609,22 +686,8 @@ def analyze_ta_session(gemini_api_key: str, video_source: VideoSource, deepgram_
                 frames = sample_screen_frames(video_path(), duration)
                 session_store.save_frames(cache_dir, frames)
 
-        # Stage 3: transcript (Deepgram API or local Whisper). Any saved
-        # transcript is reused regardless of which backend made it.
-        transcript = session_store.load_json(cache_dir, "transcript.json")
-        if transcript is None:
-            audio_path = extract_audio(video_path(), os.path.join(tmp, "audio.ogg"))
-            if transcriber == "local":
-                from local_transcribe import transcribe_locally
-                log("transcribing locally with Whisper (free)...")
-                transcript = transcribe_locally(audio_path)
-            else:
-                if not deepgram_api_key:
-                    raise ValueError("Deepgram transcription needs a DEEPGRAM_API_KEY "
-                                     "(or use transcriber='local').")
-                log("transcribing with Deepgram...")
-                transcript = transcribe_with_deepgram(deepgram_api_key, audio_path)
-            session_store.save_json(cache_dir, "transcript.json", transcript)
+        # Stage 3: transcript (Deepgram API or local Whisper)
+        transcript = _load_or_transcribe(cache_dir, video_path, tmp, transcriber, deepgram_api_key, log)
         segments = transcript["segments"]
         transcription_confidence = transcript["confidence_pct"]
         diarized = segments[0].get("speaker") is not None
@@ -689,6 +752,7 @@ def analyze_ta_session(gemini_api_key: str, video_source: VideoSource, deepgram_
             flags.append("Direct solution shared")
 
     return {
+        "mode": "analysis",
         "duration_minutes": duration_minutes,
         "participation": participation,
         "dead_air": dead_air,
