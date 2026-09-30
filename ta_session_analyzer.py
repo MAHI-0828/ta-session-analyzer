@@ -271,6 +271,43 @@ def process_session(row: dict, run_date: str, api_key: str = None, deepgram_api_
 # Run the whole day's CSV
 # ---------------------------------------------------------------------------
 
+# Google Sheets rejects a cell over 50,000 characters, so long transcripts
+# are split across transcript_1, transcript_2, ... columns (a little under
+# the limit, on line breaks where possible).
+SHEETS_CELL_LIMIT = 49_000
+
+
+def split_for_sheets(text: str, limit: int = SHEETS_CELL_LIMIT) -> list:
+    """Split text into chunks of at most `limit` characters, breaking at
+    line boundaries (a single line longer than the limit is hard-cut)."""
+    chunks, current = [], ""
+    for line in (text or "").split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def transcript_columns(transcripts: list) -> tuple:
+    """(header names, per-row cell lists) with every row padded to the same
+    number of transcript_N columns."""
+    parts = [split_for_sheets(t) for t in transcripts]
+    n = max((len(p) for p in parts), default=1)
+    return ([f"transcript_{i}" for i in range(1, n + 1)],
+            [p + [""] * (n - len(p)) for p in parts])
+
+
 def write_rollup(reports: list, errors: list, run_date: str) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_json = os.path.join(OUTPUT_DIR, f"report_{run_date}.json")
@@ -279,20 +316,21 @@ def write_rollup(reports: list, errors: list, run_date: str) -> str:
 
     out_csv = os.path.join(OUTPUT_DIR, f"report_{run_date}.csv")
     # utf-8-sig (BOM) so Excel shows Hinglish/Devanagari text correctly.
+    transcript_header, transcript_cells = transcript_columns([r["transcript"] for r in reports])
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
             "session_id", "ta_name", "student_name", "mode", "duration_minutes",
             "overall_score", "doubt_resolution", "ta_speaking_pct",
-            "student_speaking_pct", "transcriber", "flags", "transcript_path", "transcript",
+            "student_speaking_pct", "transcriber", "flags", "transcript_path", *transcript_header,
         ])
-        for r in reports:
+        for r, cells in zip(reports, transcript_cells):
             writer.writerow([
                 r["session_id"], r["ta_name"], r["student_name"], r["mode"], r["duration_minutes"],
                 r["overall_score"], r["doubt_resolution"], r["ta_speaking_pct"],
                 r["student_speaking_pct"], r["transcriber"],
                 ("; ".join(r["flags"]) or "none") if r["mode"] == "analysis" else "",
-                r["transcript_path"] or "", r["transcript"],
+                r["transcript_path"] or "", *cells,
             ])
     return out_csv
 

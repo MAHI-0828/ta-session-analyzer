@@ -45,7 +45,8 @@ import streamlit as st
 import session_store
 from local_transcribe import available_backend
 from ta_pdf_report import generate_ta_pdf
-from ta_session_analyzer import is_done, process_session, result_mode, row_key, summary_row
+from ta_session_analyzer import (is_done, process_session, result_mode, row_key, summary_row,
+                                 transcript_columns)
 
 st.set_page_config(page_title="TA Session Analyzer", page_icon="📋", layout="wide")
 
@@ -245,6 +246,11 @@ def _summary_df(summaries: list, with_transcript: bool = False) -> pd.DataFrame:
     if "flags" in df:
         df["flags"] = [("; ".join(f) or "none") if mode == "analysis" else ""
                        for f, mode in zip(df["flags"], df["mode"])]
+    if with_transcript and "transcript" in df:
+        # Split long transcripts across transcript_1, transcript_2, ... so
+        # each cell fits Google Sheets' 50,000-character limit.
+        header, cells = transcript_columns(df.pop("transcript").tolist())
+        df = pd.concat([df, pd.DataFrame(cells, columns=header, index=df.index)], axis=1)
     if (df.get("mode") == "transcript").all():
         # Transcript-only table: drop the empty score columns.
         df = df.drop(columns=["overall_score", "doubt_resolution", "ta_speaking_pct",
@@ -407,7 +413,7 @@ with tab_batch:
             st.success(f"{len(finished)}/{len(rows)} sessions from this CSV have a saved transcript"
                        + (f" ({n_analyzed} also analyzed)." if n_analyzed else "."))
             st.dataframe(_summary_df([summary_row(r) for r in finished]), use_container_width=True)
-            _batch_downloads(finished, key_prefix="batch_")
+            _batch_downloads(finished, key_prefix="batch_results_")
         if errors:
             st.error(f"{len(errors)} failed in the last run — press the run button again to retry just those.")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
@@ -440,7 +446,7 @@ with tab_saved:
         st.info("Nothing saved yet.")
     else:
         st.dataframe(_summary_df([summary_row(r) for r in saved]), use_container_width=True)
-        _batch_downloads(saved, key_prefix="saved_")
+        _batch_downloads(saved, key_prefix="saved_results_")
 
         def _label(r):
             meta = r["session_meta"]
