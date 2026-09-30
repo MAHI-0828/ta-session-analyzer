@@ -13,6 +13,8 @@ pandas>=2.0.0
 # diarizes the recording, then Gemini scores the rubric from the transcript
 # plus a few sampled screenshots. Separate from core.py's per-frame Gemini
 # image scoring used by the lecture analyzer. Needs a GEMINI_API_KEY and a
-# DEEPGRAM_API_KEY (free credits: console.deepgram.com).
+# DEEPGRAM_API_KEY (free credits: console.deepgram.com) — or skip Deepgram
+# entirely and transcribe for free on your own machine with
+# requirements-local.txt (local Whisper; see local_transcribe.py).
 google-genai>=0.3.0
 pydantic>=2.0.0

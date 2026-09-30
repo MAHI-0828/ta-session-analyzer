@@ -2,8 +2,10 @@
 Core analysis engine for the TA Session Analyzer.
 
 Pipeline:
-    Recording -> Deepgram prerecorded API transcribes + diarizes it (speaker
-    labels come back generic: "0", "1", ...) -> a handful of evenly-spaced
+    Recording -> ffmpeg pulls out a small mono audio track -> Deepgram
+    prerecorded API (or free local Whisper, see local_transcribe.py)
+    transcribes it (Deepgram also diarizes: speaker labels come back
+    generic, "0", "1", ...) -> a handful of evenly-spaced
     screenshots are pulled from the shared screen -> one Gemini call maps the
     generic speakers to TA/Student and scores the session against the rubric
     using the transcript + screenshots -> local participation/dead-air math
@@ -19,24 +21,32 @@ expensive part of the pipeline while Gemini quota is spent only on analysis.
 Trade-off: TA/Student attribution now comes from conversational content
 alone (who explains vs. who asks) rather than voice + visual cues together,
 so it's worth spot-checking on calls with unusual dynamics.
+
+Resumability: every stage (media probe, screenshots, transcript, Gemini
+analysis, final report) is saved to the session's cache_dir as soon as it
+finishes, and reused on the next run. A batch that dies halfway — a
+refresh, a crash, a rate limit — picks up where it stopped and never pays
+for the same Deepgram/Gemini call twice. See session_store.py.
+
 The rest of the codebase (app.py, analyze.py, core.py, auto_lecture_analyzer.py)
 is untouched and still runs on Gemini per-frame image scoring.
 """
 
+import hashlib
 import json
-import mimetypes
 import os
 import re
 import subprocess
 import tempfile
-from typing import List, Literal, Optional
+from typing import Callable, List, Literal, Optional, Union
 
 import requests
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 from recording_utils import get_duration_seconds
+import session_store
 
 # ─── Scoring config (per PRD "Final Score" table) ────────────────────────────
 
@@ -73,6 +83,12 @@ DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
 # Gemini to look at — enough to catch a solution left on screen without
 # paying full-video multimodal token costs.
 SCREEN_FRAME_COUNT = 8
+
+# Hard ceiling on a single Gemini request. Without it a stalled request can
+# hang a batch forever (the "stuck after 10-15 sessions" symptom).
+GEMINI_TIMEOUT_MS = 300_000
+
+TRANSCRIBERS = ("deepgram", "local")
 
 
 def fmt_ts(seconds: float) -> str:
@@ -127,6 +143,21 @@ def sample_screen_frames(video_path: str, duration: float, count: int = SCREEN_F
     return frames
 
 
+def extract_audio(video_path: str, out_path: str) -> str:
+    """Pull a small mono 16kHz Opus track out of the recording (~5MB for a
+    30-min call vs. hundreds of MB of video). Deepgram bills by duration, not
+    size, so this costs nothing extra — it just makes the upload fast and
+    reliable, and it's the format Whisper wants anyway."""
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "libopus", "-b:a", "24k", out_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(f"ffmpeg audio extraction failed: {result.stderr[-500:]}")
+    return out_path
+
+
 def compute_participation(labeled_segments: list) -> dict:
     ta_time = sum(s["end"] - s["start"] for s in labeled_segments if s["speaker"] == "TA")
     student_time = sum(s["end"] - s["start"] for s in labeled_segments if s["speaker"] == "Student")
@@ -171,7 +202,14 @@ def build_transcript_text(labeled_segments: list) -> str:
 
 def build_generic_transcript_text(segments: list) -> str:
     """Same formatting as build_transcript_text, but before TA/Student roles
-    have been assigned — used for the transcript we hand to Gemini."""
+    have been assigned — used for the transcript we hand to Gemini. Local
+    Whisper transcripts have no speaker labels, so their lines carry a
+    segment number instead for Gemini to assign speakers by."""
+    if segments and segments[0].get("speaker") is None:
+        return "\n".join(
+            f"[#{i} {fmt_ts(seg['start'])}] {seg['text']}"
+            for i, seg in enumerate(segments)
+        )
     return "\n".join(
         f"[{fmt_ts(seg['start'])}] Speaker {seg['speaker']}: {seg['text']}"
         for seg in segments
@@ -180,14 +218,12 @@ def build_generic_transcript_text(segments: list) -> str:
 
 # ─── 2. Deepgram transcription + diarization ─────────────────────────────────
 
-def transcribe_with_deepgram(api_key: str, media_path: str) -> dict:
-    """Sends the recording straight to Deepgram's prerecorded API — it reads
-    the audio out of the video container itself, no local extraction needed
-    — and returns diarized utterances plus an overall confidence score.
-    Speakers come back as generic integers (0, 1, ...); Gemini maps them to
-    TA/Student afterwards from the transcript content alone."""
-    mime = mimetypes.guess_type(media_path)[0] or "video/mp4"
-    with open(media_path, "rb") as f:
+def transcribe_with_deepgram(api_key: str, audio_path: str) -> dict:
+    """Sends the extracted audio track (see extract_audio) to Deepgram's
+    prerecorded API and returns diarized utterances plus an overall
+    confidence score. Speakers come back as generic integers (0, 1, ...);
+    Gemini maps them to TA/Student afterwards from the transcript content."""
+    with open(audio_path, "rb") as f:
         response = requests.post(
             DEEPGRAM_ENDPOINT,
             params={
@@ -199,7 +235,7 @@ def transcribe_with_deepgram(api_key: str, media_path: str) -> dict:
             },
             headers={
                 "Authorization": f"Token {api_key}",
-                "Content-Type": mime,
+                "Content-Type": "audio/ogg",
             },
             data=f,
             timeout=600,
@@ -220,7 +256,8 @@ def transcribe_with_deepgram(api_key: str, media_path: str) -> dict:
     if not segments:
         raise RuntimeError("No speech detected in recording.")
     avg_confidence = sum(s["confidence"] for s in segments) / len(segments)
-    return {"segments": segments, "confidence_pct": round(avg_confidence * 100, 1)}
+    return {"segments": segments, "confidence_pct": round(avg_confidence * 100, 1),
+            "backend": "deepgram"}
 
 
 def _normalize_speaker_label(label: str) -> str:
@@ -284,8 +321,13 @@ class TechnicalAccuracy(BaseModel):
     details: str
 
 
-class SessionAnalysisResult(BaseModel):
-    speaker_roles: SpeakerRoles
+class SpeakerTurn(BaseModel):
+    from_segment: int
+    to_segment: int
+    speaker: Literal["TA", "Student"]
+
+
+class _RubricAnalysis(BaseModel):
     screen_share: ScreenShare
     doubt_resolution: DoubtResolution
     teaching_quality: TeachingQuality
@@ -298,6 +340,21 @@ class SessionAnalysisResult(BaseModel):
     student_sentiment: Literal["Satisfied", "Neutral", "Dissatisfied"]
     summary: str
     recommendations: List[str]
+
+
+# Two variants of the same response, differing only in how speakers are
+# identified. Built with create_model so the speaker field comes FIRST in the
+# schema — Gemini generates fields in order, so it decides who the TA is
+# before scoring the TA.
+_RUBRIC_FIELDS = {name: (field.annotation, ...) for name, field in _RubricAnalysis.model_fields.items()}
+
+# For diarized (Deepgram) transcripts: just say which label is the TA.
+SessionAnalysisResult = create_model(
+    "SessionAnalysisResult", speaker_roles=(SpeakerRoles, ...), **_RUBRIC_FIELDS)
+
+# For local Whisper transcripts: assign every segment to TA/Student.
+UndiarizedSessionAnalysisResult = create_model(
+    "UndiarizedSessionAnalysisResult", speaker_turns=(List[SpeakerTurn], ...), **_RUBRIC_FIELDS)
 
 
 class ChatAnalysisResult(BaseModel):
@@ -314,6 +371,8 @@ COMBINED_SYSTEM_PROMPT = f"""You are an expert instructional-quality reviewer an
 
 Step 1 — Identify who is the TA:
 Exactly one speaker label is the TA — the one guiding, explaining concepts, asking clarifying/verification questions, and concluding the discussion. The student is the one describing their doubt, asking questions, and responding to explanations. If more than one non-TA label appears, they are still collectively "the student". Return ta_speaker_label as exactly the label text as it appears in the transcript (e.g. "0"), with a short reasoning.
+
+If instead the transcript has NO speaker labels (lines look like "[#12 03:04] text", produced by a local speech-to-text model that cannot tell voices apart), infer who is speaking each numbered segment from the conversation itself (who explains vs. who asks, replies to questions, turn-taking) and return speaker_turns: consecutive runs of segments by the same speaker, as {{from_segment, to_segment, speaker}} with inclusive segment numbers, covering every segment from #0 to the last one in order.
 
 Step 2 — Read the shared-screen screenshots (if provided):
 Note what kind of content was shown (coding IDE, terminal, browser, LeetCode/judge, notebook, slides, file explorer, other), and whether any code/SQL/query visible on screen was a complete, ready-to-submit final solution rather than a partial hint. classification is "Good" if only hints/guidance were visible, "Warning" if borderline/near-complete help was shown, "Violation" if a complete final solution was shown on screen. If screen analysis was not requested for this session (see the user message), set classification to "Good", leave content_types_observed/code_or_query_evidence empty, and note in summary that screen analysis was skipped by request.
@@ -354,8 +413,14 @@ classification is "Good" if only hints were shared, "Warning" if borderline, "Vi
 
 # ─── 5. Gemini plumbing ───────────────────────────────────────────────────────
 
+def make_gemini_client(api_key: str) -> "genai.Client":
+    return genai.Client(api_key=api_key,
+                        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+
+
 def analyze_session_with_gemini(client: "genai.Client", transcript_text: str,
-                                 frames: List[bytes], analyze_screen: bool) -> SessionAnalysisResult:
+                                 frames: List[bytes], analyze_screen: bool,
+                                 diarized: bool = True):
     screen_requested = analyze_screen and bool(frames)
     user_prompt = (
         f"screen_share_analysis_requested: {'yes' if screen_requested else 'no'}\n\n"
@@ -366,16 +431,17 @@ def analyze_session_with_gemini(client: "genai.Client", transcript_text: str,
     if screen_requested:
         contents += [types.Part.from_bytes(data=frame, mime_type="image/jpeg") for frame in frames]
 
+    schema = SessionAnalysisResult if diarized else UndiarizedSessionAnalysisResult
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=COMBINED_SYSTEM_PROMPT,
             response_mime_type="application/json",
-            response_schema=SessionAnalysisResult,
+            response_schema=schema,
         ),
     )
-    return SessionAnalysisResult.model_validate_json(response.text)
+    return schema.model_validate_json(response.text)
 
 
 def analyze_chat(client: "genai.Client", chat_text: str) -> dict:
@@ -460,52 +526,152 @@ def build_flags(analysis: dict, participation: dict, dead_air: dict, duration_mi
     return flags
 
 
-# ─── 8. End-to-end orchestration ─────────────────────────────────────────────
+# ─── 8. End-to-end orchestration (staged + cached) ──────────────────────────
 
-def analyze_ta_session(gemini_api_key: str, video_path: str, deepgram_api_key: str,
-                        analyze_screen: bool = True, chat_text: str = None) -> dict:
+VideoSource = Union[str, Callable[[], str]]
+
+
+def _label_segments(segments: list, data: dict) -> list:
+    """Turn Gemini's speaker answer into TA/Student labels per segment —
+    either a "which Deepgram label is the TA" answer or, for local Whisper
+    transcripts, a list of speaker turns over segment numbers."""
+    if "speaker_turns" in data:
+        by_index = {}
+        for turn in data["speaker_turns"]:
+            for i in range(turn["from_segment"], turn["to_segment"] + 1):
+                by_index[i] = turn["speaker"]
+        labels, prev = [], "TA"
+        for i in range(len(segments)):
+            prev = by_index.get(i, prev)  # gaps inherit the previous speaker
+            labels.append(prev)
+    else:
+        ta_label = _normalize_speaker_label(data["speaker_roles"]["ta_speaker_label"])
+        labels = ["TA" if _normalize_speaker_label(s["speaker"]) == ta_label else "Student"
+                  for s in segments]
+    return [{"start": s["start"], "end": s["end"], "speaker": label, "text": s["text"]}
+            for s, label in zip(segments, labels)]
+
+
+def _sha(text: Optional[str]) -> Optional[str]:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12] if text else None
+
+
+def analyze_ta_session(gemini_api_key: str, video_source: VideoSource, deepgram_api_key: str = "",
+                        analyze_screen: bool = True, chat_text: str = None,
+                        cache_dir: Optional[str] = None, transcriber: str = "deepgram",
+                        force_reanalysis: bool = False, log: Callable[[str], None] = print) -> dict:
     """Runs the full pipeline on one recording and returns a report dict ready
-    for scoring output / PDF / CSV / JSON. Transcription + diarization run on
-    Deepgram; Gemini only maps speakers to TA/Student and scores the rubric."""
-    duration = get_duration_seconds(video_path)
-    audio_quality = estimate_audio_quality(video_path)
+    for scoring output / PDF / CSV / JSON.
 
-    transcript = transcribe_with_deepgram(deepgram_api_key, video_path)
-    segments = transcript["segments"]
-    transcription_confidence = transcript["confidence_pct"]
-    generic_transcript_text = build_generic_transcript_text(segments)
+    video_source is a local path, or a zero-arg callable that downloads the
+    recording and returns its path — called only if some stage still needs
+    the video, so a resumed session whose transcript/screenshots are cached
+    skips the download entirely.
 
-    frames = sample_screen_frames(video_path, duration) if analyze_screen else []
+    cache_dir (optional) is where each finished stage is saved and reused
+    from. transcriber is "deepgram" (API, diarized) or "local" (free Whisper
+    on this machine; Gemini assigns speakers). force_reanalysis re-runs the
+    Gemini step while still reusing the saved transcript + screenshots."""
+    if transcriber not in TRANSCRIBERS:
+        raise ValueError(f"transcriber must be one of {TRANSCRIBERS}, got {transcriber!r}")
 
-    client = genai.Client(api_key=gemini_api_key)
-    result = analyze_session_with_gemini(client, generic_transcript_text, frames, analyze_screen)
-    data = result.model_dump()
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_dir = cache_dir or os.path.join(tmp, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        resolved_video = {}
 
-    ta_label = _normalize_speaker_label(data.pop("speaker_roles")["ta_speaker_label"])
-    labeled = [
-        {
-            "start": s["start"], "end": s["end"],
-            "speaker": "TA" if _normalize_speaker_label(s["speaker"]) == ta_label else "Student",
-            "text": s["text"],
-        }
-        for s in segments
-    ]
-    participation = compute_participation(labeled)
-    dead_air = compute_dead_air(labeled, duration)
-    transcript_text = build_transcript_text(labeled)
+        def video_path() -> str:
+            if "path" not in resolved_video:
+                resolved_video["path"] = video_source() if callable(video_source) else video_source
+            return resolved_video["path"]
 
-    screen_share = data.pop("screen_share")
-    if not analyze_screen:
-        screen_share = None
+        # Stage 1: duration + audio-volume heuristic (local, ffmpeg)
+        media = session_store.load_json(cache_dir, "media.json")
+        if media is None:
+            log("probing media...")
+            media = {"duration": get_duration_seconds(video_path()),
+                     "audio_quality": estimate_audio_quality(video_path())}
+            session_store.save_json(cache_dir, "media.json", media)
+        duration = media["duration"]
+        audio_quality = media["audio_quality"]
 
-    analysis = data  # remaining keys match the original `analysis` contract
+        # Stage 2: shared-screen screenshots (local, ffmpeg)
+        frames = []
+        if analyze_screen:
+            frames = session_store.load_frames(cache_dir)
+            if frames is None:
+                log("sampling screen frames...")
+                frames = sample_screen_frames(video_path(), duration)
+                session_store.save_frames(cache_dir, frames)
 
-    chat_analysis = None
-    if chat_text:
-        try:
-            chat_analysis = analyze_chat(client, chat_text)
-        except Exception:
-            chat_analysis = None  # chat analysis is best-effort/optional
+        # Stage 3: transcript (Deepgram API or local Whisper). Any saved
+        # transcript is reused regardless of which backend made it.
+        transcript = session_store.load_json(cache_dir, "transcript.json")
+        if transcript is None:
+            audio_path = extract_audio(video_path(), os.path.join(tmp, "audio.ogg"))
+            if transcriber == "local":
+                from local_transcribe import transcribe_locally
+                log("transcribing locally with Whisper (free)...")
+                transcript = transcribe_locally(audio_path)
+            else:
+                if not deepgram_api_key:
+                    raise ValueError("Deepgram transcription needs a DEEPGRAM_API_KEY "
+                                     "(or use transcriber='local').")
+                log("transcribing with Deepgram...")
+                transcript = transcribe_with_deepgram(deepgram_api_key, audio_path)
+            session_store.save_json(cache_dir, "transcript.json", transcript)
+        segments = transcript["segments"]
+        transcription_confidence = transcript["confidence_pct"]
+        diarized = segments[0].get("speaker") is not None
+
+        # Stage 4: Gemini rubric scoring. Cached together with the inputs it
+        # depended on, so flipping analyze_screen invalidates it but a plain
+        # re-run does not.
+        client = None
+        fingerprint = {"analyze_screen": bool(analyze_screen and frames),
+                       "transcript_backend": transcript.get("backend", "deepgram"),
+                       "model": GEMINI_MODEL}
+        cached = session_store.load_json(cache_dir, "analysis.json")
+        if cached and cached.get("inputs") == fingerprint and not force_reanalysis:
+            data = cached["result"]
+        else:
+            log("scoring with Gemini...")
+            client = make_gemini_client(gemini_api_key)
+            result = analyze_session_with_gemini(client, build_generic_transcript_text(segments),
+                                                 frames, analyze_screen, diarized=diarized)
+            data = result.model_dump()
+            session_store.save_json(cache_dir, "analysis.json",
+                                    {"inputs": fingerprint, "result": data})
+        data = dict(data)
+
+        labeled = _label_segments(segments, data)
+        data.pop("speaker_roles", None)
+        data.pop("speaker_turns", None)
+
+        participation = compute_participation(labeled)
+        dead_air = compute_dead_air(labeled, duration)
+        transcript_text = build_transcript_text(labeled)
+
+        screen_share = data.pop("screen_share")
+        if not analyze_screen:
+            screen_share = None
+
+        analysis = data  # remaining keys match the original `analysis` contract
+
+        # Stage 5 (optional): chat log analysis, cached per chat-text hash
+        chat_analysis = None
+        if chat_text:
+            cached_chat = session_store.load_json(cache_dir, "chat_analysis.json")
+            if cached_chat and cached_chat.get("chat_sha") == _sha(chat_text) and not force_reanalysis:
+                chat_analysis = cached_chat["result"]
+            else:
+                try:
+                    client = client or make_gemini_client(gemini_api_key)
+                    chat_analysis = analyze_chat(client, chat_text)
+                    session_store.save_json(cache_dir, "chat_analysis.json",
+                                            {"chat_sha": _sha(chat_text), "result": chat_analysis})
+                except Exception:
+                    chat_analysis = None  # chat analysis is best-effort/optional
 
     duration_minutes = round(duration / 60, 1)
     score_breakdown = compute_final_score(analysis, participation)
@@ -523,10 +689,12 @@ def analyze_ta_session(gemini_api_key: str, video_path: str, deepgram_api_key: s
         "dead_air": dead_air,
         "audio_quality": audio_quality,
         "transcription_confidence_pct": transcription_confidence,
+        "transcriber": transcript.get("backend", "deepgram"),
         "screen_share": screen_share,
         "chat_analysis": chat_analysis,
         "analysis": analysis,
         "score_breakdown": score_breakdown,
         "flags": flags,
         "transcript_text": transcript_text,
+        "transcript_segments": labeled,
     }
